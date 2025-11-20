@@ -408,16 +408,17 @@ async def exotel_ws_bootstrap():
 
 
 # ---------------- Realtime media bridge (Exotel <-> OpenAI LIC Agent) ----------------
+# ---------------- Realtime media bridge (Exotel <-> OpenAI LIC Agent) ----------------
 @app.websocket("/exotel-media")
 async def exotel_media_ws(ws: WebSocket):
     await ws.accept()
     logger.info("Exotel WS connected (Shashinath LIC agent, realtime)")
 
-     # --- NEW: metadata for this call ---
-    call_id = None          # Exotel CallSid
-    caller_number = None    # customer's phone
-    stream_sid = None       # Exotel stream ID used by /exotel-media
-    # -----------------------------------
+    # --- Metadata for this call ---
+    call_id: Optional[str] = None        # Exotel CallSid
+    caller_number: Optional[str] = None  # customer's phone
+    stream_sid: Optional[str] = None     # Exotel stream ID used by /exotel-media
+    # --------------------------------
 
     if not OPENAI_API_KEY:
         logger.error("No OPENAI_API_KEY; closing Exotel stream.")
@@ -425,7 +426,6 @@ async def exotel_media_ws(ws: WebSocket):
         return
 
     # Exotel stream info
-    stream_sid: Optional[str] = None
     seq_num = 1
     chunk_num = 1
     start_ts = time.time()
@@ -435,6 +435,8 @@ async def exotel_media_ws(ws: WebSocket):
     pump_task: Optional[asyncio.Task] = None
 
     async def send_openai(payload: dict):
+        """Send JSON payload to OpenAI Realtime WS."""
+        nonlocal openai_ws
         if not openai_ws or openai_ws.closed:
             logger.warning("Cannot send to OpenAI: WS not ready")
             return
@@ -454,7 +456,7 @@ async def exotel_media_ws(ws: WebSocket):
         now_ms = lambda: int((time.time() - start_ts) * 1000)
 
         for i in range(0, len(pcm8), FRAME_BYTES):
-            chunk_bytes = pcm8[i:i + FRAME_BYTES]
+            chunk_bytes = pcm8[i : i + FRAME_BYTES]
             if not chunk_bytes:
                 continue
 
@@ -482,8 +484,12 @@ async def exotel_media_ws(ws: WebSocket):
 
             seq_num += 1
             chunk_num += 1
-    async def connect_openai():
-        """Connect to OpenAI Realtime and configure Shashinath LIC persona + intro."""
+
+    async def connect_openai(conn_call_id: str, conn_caller_number: str):
+        """
+        Connect to OpenAI Realtime, configure LIC persona,
+        and start the pump() loop that sends audio back to Exotel.
+        """
         nonlocal openai_session, openai_ws, pump_task
 
         try:
@@ -491,84 +497,116 @@ async def exotel_media_ws(ws: WebSocket):
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "OpenAI-Beta": "realtime=v1",
             }
+
             url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
             openai_session = ClientSession()
-            logger.info("Connecting to OpenAI Realtime WS…")
+            logger.info("Connecting to OpenAI Realtime WS...")
             openai_ws = await openai_session.ws_connect(url, headers=headers)
             logger.info("Connected to OpenAI WS")
 
-            # Session config: PCM16 in/out, server VAD, LIC persona
-            await send_openai({
-                "type": "session.update",
-                "session": {
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
-																					  
-                    "voice": "alloy",
-                    "turn_detection": {
-                        "type": "server_vad"
+            # ---------------- LIC persona instructions ----------------
+            instructions_text = (
+                "You are Mr. Shashinath Thakur, a senior LIC insurance agent from India. "
+                "You speak in friendly Hinglish (mix of Hindi and English), calm and trustworthy, "
+                "like a real experienced LIC advisor.\n\n"
+                f"This call metadata:\n- call_id = {conn_call_id}\n- phone_number = {conn_caller_number}\n\n"
+                "GOALS DURING CALL:\n"
+                "1. Greet the caller warmly and clearly introduce yourself as 'LIC agent Mr. Shashinath Thakur'.\n"
+                "2. Ask short, clear questions to understand their LIC needs (term plan, money-back, child plan, etc.).\n"
+                "3. Explain policies simply: premium, cover amount, term, tax benefit, riders, and claim process.\n"
+                "4. Always keep answers short (1–2 sentences) and then ask ONE follow-up question. "
+                "   Wait silently for the caller to speak again before responding.\n"
+                "5. Never talk about topics outside LIC insurance and basic financial planning.\n\n"
+                "At the very end of the call (after final goodbye), you should internally summarise the call. "
+                "The backend will separately store summaries in a database."
+            )
+            # ----------------------------------------------------------------
+
+            session_config: dict = {
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "voice": "alloy",
+                # let server VAD detect when caller stops
+                "turn_detection": {"type": "server_vad"},
+                "instructions": instructions_text,
+            }
+
+            # Send initial session.update
+            await send_openai(
+                {
+                    "type": "session.update",
+                    "session": session_config,
+                }
+            )
+
+            logger.info("Sent session.update with LIC persona")
+
+            # Ask the model to start the first greeting turn
+            await send_openai(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "instructions": (
+                            "Start the call now: greet the caller, introduce yourself, "
+                            "and ask how you can help with LIC today."
+                        )
                     },
-                    "instructions": (
-                        "You are Mr. Shashinath Thakur, a senior LIC life insurance advisor "
-                        "based in Mumbai. You speak in friendly Hinglish (mix of Hindi and English), "
-                        "calm and trustworthy, like a real LIC agent on a phone call. "
-                        "Help callers with LIC life insurance, term plans, premiums, riders, "
-                        "maturity values, tax benefits, and claim process. "
-                        "Always keep each reply very short (about 1–2 sentences) and then stop. "
-                        "Wait silently for the caller to speak again before responding. "
-                        "Never talk about topics outside LIC insurance and basic financial planning."
-                    ),
-                },
-            })
+                }
+            )
 
-            # Initial greeting: Shashinath introduces himself once
-									
-            await send_openai({
-                "type": "response.create",
-                "response": {
-                    "modalities": ["audio", "text"],
-                    "instructions": (
-                        "The phone call has just started. Politely greet the caller and clearly "
-                        "introduce yourself as 'LIC agent Mr. Shashinath Thakur from Mumbai' in Hinglish. "
-                        "Example: 'Namaste, main LIC agent Mr. Shashinath Thakur bol raha hoon, "
-                        "Mumbai se. Main aapko LIC policy ya term plan mein kaise help kar sakta hoon?' "
-                        "Speak only 1–2 short sentences, then stop and wait silently for the caller."
-                    ),
-                },
-            })
-
+            # ---------------- Pump: receive audio from OpenAI and send to Exotel ----------------
             async def pump():
-													
                 try:
                     async for msg in openai_ws:
                         if msg.type != WSMsgType.TEXT:
                             continue
-                        evt = msg.json()
-                        et = evt.get("type")
-                        logger.info("OpenAI EVENT: %s", et)
 
+                        try:
+                            evt = json.loads(msg.data)
+                        except Exception:
+                            logger.exception("Failed to parse OpenAI WS message")
+                            continue
+
+                        et = evt.get("type")
+                        logger.debug("OpenAI EVENT: %s - %s", et, evt)
+
+                        # Audio deltas from model
                         if et in ("response.audio.delta", "response.output_audio.delta"):
-                            # Handle both possible shapes
-                            b64 = evt.get("delta")
-                            if not b64 and "audio" in evt and "data" in evt["audio"]:
-                                b64 = evt["audio"]["data"]
+                            # Each delta is base64-encoded PCM16 at 24kHz
+                            delta = evt.get("delta") or evt.get("audio") or {}
+                            b64 = delta.get("audio") or delta.get("data")
                             if not b64:
                                 continue
-															  
-                            pcm24 = base64.b64decode(b64)
-                            pcm8 = downsample_24k_to_8k_pcm16(pcm24)
-										   
+
+                            try:
+                                pcm24 = base64.b64decode(b64)
+                            except Exception:
+                                logger.exception("Failed to decode audio delta")
+                                continue
+
+                            # Downsample 24kHz -> 8kHz for Exotel
+                            try:
+                                pcm8 = downsample_24k_to_8k_pcm16(pcm24)
+                            except Exception:
+                                logger.exception("Downsampling 24k -> 8k failed")
+                                continue
+
+                            # Send to Exotel as media frames
                             await send_audio_to_exotel(pcm8)
 
-                        elif et in ("response.audio.done", "response.output_audio.done", "response.done"):
-                            logger.info("OpenAI finished a response turn.")
+                        elif et in (
+                            "response.audio.done",
+                            "response.output_audio.done",
+                            "response.done",
+                        ):
+                            logger.info("OpenAI response finished.")
 
                         elif et == "error":
-                            logger.error("OpenAI ERROR: %s", evt)
+                            logger.error("OpenAI ERROR event: %s", evt)
 
                 except Exception as e:
-                    logger.exception("OpenAI pump error: %s", e)
+                    logger.exception("Pump error: %s", e)
 
             pump_task = asyncio.create_task(pump())
 
@@ -593,7 +631,7 @@ async def exotel_media_ws(ws: WebSocket):
                 start_obj = evt.get("start") or {}
                 stream_sid = start_obj.get("stream_sid") or evt.get("stream_sid")
                 start_ts = time.time()
-                logger.info("Exotel stream started, stream_sid=%s", stream_sid)
+
                 call_id = start_obj.get("call_sid") or start_obj.get("callSid") or evt.get("call_sid")
                 caller_number = (
                     start_obj.get("from")
@@ -602,22 +640,23 @@ async def exotel_media_ws(ws: WebSocket):
                     or evt.get("from")
                 )
 
-                # Optional: init transcript store for this call
-                CALL_TRANSCRIPTS[stream_sid] = {
-                    "call_id": call_id,
-                    "phone_number": caller_number,
-                    "turns": []  # list of (speaker, text)
-                }
                 logger.info(
-                   "Exotel stream started, stream_sid=%s, call_id=%s, from=%s",
+                    "Exotel stream started, stream_sid=%s, call_id=%s, from=%s",
                     stream_sid,
                     call_id,
                     caller_number,
                 )
 
+                # Optional: init transcript store for this call
+                CALL_TRANSCRIPTS[stream_sid] = {
+                    "call_id": call_id,
+                    "phone_number": caller_number,
+                    "turns": []  # list of (speaker, text) – you can fill later
+                }
+
                 if not openai_started:
                     openai_started = True
-                    await connect_openai()
+                    await connect_openai(call_id or "unknown_call", caller_number or "")
 
             elif ev == "media":
                 # Caller audio (8k PCM16) -> upsample to 24k -> send to OpenAI
@@ -632,24 +671,25 @@ async def exotel_media_ws(ws: WebSocket):
 
                     pcm24 = upsample_8k_to_24k_pcm16(pcm8)
                     audio_b64 = base64.b64encode(pcm24).decode("ascii")
-                    await send_openai({
-                        "type": "input_audio_buffer.append",
-                        "audio": audio_b64,
-                    })
+                    await send_openai(
+                        {
+                            "type": "input_audio_buffer.append",
+                            "audio": audio_b64,
+                        }
+                    )
                     # NOTE: With server_vad we DO NOT call input_audio_buffer.commit manually.
                     # The server will commit automatically when it detects end-of-speech.
 
             elif ev == "stop":
                 logger.info("Exotel sent stop; closing WS.")
                 try:
-                # 🔹 Fetch transcript metadata for this call
+                    # 🔹 Fetch transcript metadata for this call
                     meta = CALL_TRANSCRIPTS.get(stream_sid) or {}
                     meta_call_id = meta.get("call_id") or call_id or (stream_sid or "unknown_call")
                     meta_phone = meta.get("phone_number") or caller_number or ""
                     transcript_turns = meta.get("turns") or []
 
                     # 🔹 Call the summariser + DB writer
-                    #    This uses the function from summarise_and_save.py (step 3 code)
                     summary_result = summarise_and_save_call_summary(
                         call_id=meta_call_id,
                         phone_number=meta_phone,
@@ -664,6 +704,7 @@ async def exotel_media_ws(ws: WebSocket):
                     if stream_sid in CALL_TRANSCRIPTS:
                         CALL_TRANSCRIPTS.pop(stream_sid, None)
                 break
+
             else:
                 logger.warning("Unhandled Exotel event: %s", ev)
 
@@ -703,7 +744,6 @@ async def exotel_media_ws(ws: WebSocket):
                 logger.info("Call summary (from finally) saved: %s", summary_result)
         except Exception as e:
             logger.exception("Failed to summarise & save call in finally: %s", e)
-
 # ---------------- Simple CSV + Logs Dashboard ----------------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
