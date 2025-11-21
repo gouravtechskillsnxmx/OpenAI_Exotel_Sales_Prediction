@@ -8,7 +8,6 @@ twilio
 openai>=1.0.0
 boto3
 pydantic
-sqlalchemy
 psycopg2-binary
 redis
 python-dotenv
@@ -16,4 +15,11 @@ python-multipart
 flask
 scipy
 numpy
+mcp[cli]==1.0.0
+fastmcp==0.2.0
+starlette==0.39.0
+uvicorn[standard]==0.30.0
+SQLAlchemy==2.0.36
+psycopg2-binary==2.9.9
+httpx>=0.27.0
 
