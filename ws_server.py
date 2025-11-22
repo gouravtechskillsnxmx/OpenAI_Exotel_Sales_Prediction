@@ -158,11 +158,11 @@ def upsample_8k_to_24k_pcm16(pcm8: bytes) -> bytes:
     """8 kHz mono PCM16 -> 24 kHz mono PCM16 using stdlib audioop."""
     converted, _ = audioop.ratecv(pcm8, 2, 1, 8000, 24000, None)
     return converted
-
+from fastapi.responses import PlainTextResponse
 @app.get("/exotel-ws-bootstrap")
 async def exotel_ws_bootstrap():
     ws_url = f"wss://openai-exotel-sales-prediction.onrender.com/exotel-media"
-    return JSONResponse({"url": ws_url})
+    return PlainTextResponse(ws_url)
 
 # ---------------- Helper: Exotel outbound (Connect API) ----------------
 
