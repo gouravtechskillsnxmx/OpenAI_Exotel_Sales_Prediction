@@ -160,9 +160,16 @@ def upsample_8k_to_24k_pcm16(pcm8: bytes) -> bytes:
     return converted
 from fastapi.responses import PlainTextResponse
 @app.get("/exotel-ws-bootstrap")
+
 async def exotel_ws_bootstrap():
-    ws_url = f"wss://openai-exotel-sales-prediction.onrender.com/exotel-media"
-    return PlainTextResponse(ws_url)
+    try:
+        base = PUBLIC_BASE_URL or "openai-exotel-sales-prediction.onrender.com"
+        url = f"wss://{base}/exotel-media"
+        logger.info("Bootstrap served: %s", url)
+        return {"url": url}
+    except Exception as e:
+        logger.exception("/exotel-ws-bootstrap error: %s", e)
+        return {"url": f"wss://{(PUBLIC_BASE_URL or 'openai-exotel-sales-prediction.onrender.com')}/exotel-media"}
 
 # ---------------- Helper: Exotel outbound (Connect API) ----------------
 
