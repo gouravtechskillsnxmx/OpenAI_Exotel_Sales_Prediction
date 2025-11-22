@@ -1,12 +1,14 @@
 """
-ws_server.py — Exotel Outbound Realtime LIC Agent + Call Logs + CSV Dashboard
+ws_server.py — Exotel Outbound Realtime LIC Agent + Call Logs + Leads + MCP
 
 Features:
 - Outbound calls via Exotel Connect API to a Voicebot App/Flow (EXO_FLOW_ID)
 - Realtime LIC insurance agent voicebot using OpenAI Realtime
+- MCP integration (LIC_CRM_MCP_BASE_URL) for save_call_summary tool
 - Exotel status webhook saving call details into SQLite
+- Leads table + CSV upload to trigger outbound calls
 - Simple dashboard at /dashboard:
-  - Upload CSV (number,name) to trigger outbound calls
+  - Upload CSV (name,phone) to trigger outbound calls
   - View recent call logs
 
 ENV (set in Render):
@@ -18,13 +20,13 @@ ENV (set in Render):
   EXO_CALLER_ID     your Exophone, e.g. 09513886363
 
   OPENAI_API_KEY or OpenAI_Key or OPENAI_KEY
-  OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview (optional)
+  OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview (recommended)
 
   PUBLIC_BASE_URL   e.g. openai-exotel-elevenlabs-outbound.onrender.com
   LOG_LEVEL=INFO
 
   DB_PATH=/tmp/call_logs.db   (or /data/call_logs.db if you have persistent disk)
-  SAVE_TTS_WAV=1          (if you want to write TTS wav files under /tmp)
+  SAVE_TTS_WAV=1              (if you want to write TTS wav files under /tmp)
 
   LIC_CRM_MCP_BASE_URL=https://lic-crm-mcp.onrender.com    (MCP server for saving call summaries)
 """
@@ -44,13 +46,22 @@ from typing import Optional, List
 import audioop
 import httpx
 import requests
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, UploadFile, File
+from aiohttp import ClientSession, WSMsgType
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    Request,
+    UploadFile,
+    File,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
-from openai import OpenAI
 from pydantic import BaseModel
-import numpy as np
-from scipy.signal import resample
+
+# Optional: these were in your original file; keep if installed
+import numpy as np  # noqa: F401
+from scipy.signal import resample  # noqa: F401
 
 # ---------------- Logging ----------------
 level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -60,7 +71,6 @@ logger = logging.getLogger("ws_server")
 # ---------------- Global transcript store ----------------
 CALL_TRANSCRIPTS = {}
 
-
 # ---------------- DB (SQLite) ----------------
 DB_PATH = os.getenv("DB_PATH", "/tmp/call_logs.db")
 
@@ -69,6 +79,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
+    # call logs
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS call_logs (
@@ -86,6 +97,7 @@ def init_db():
         """
     )
 
+    # leads
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS leads (
@@ -102,12 +114,13 @@ def init_db():
 
     conn.commit()
     conn.close()
+    logger.info("SQLite DB initialized at %s", DB_PATH)
 
 
 init_db()
 
 # ---------------- FastAPI app ----------------
-app = FastAPI()
+app = FastAPI(title="Outbound LIC Voicebot")
 
 app.add_middleware(
     CORSMiddleware,
@@ -117,10 +130,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- Exotel Helper ----------------
+# ---------------- Exotel Helpers ----------------
 
 
-def exotel_call_url():
+def exotel_call_url() -> str:
     """
     Compose Exotel Connect API URL:
       https://{subdomain}.exotel.com/v1/Accounts/{sid}/Calls/connect
@@ -143,11 +156,6 @@ def exotel_headers_auth():
 # ---------------- Audio helpers ----------------
 
 
-def pcm16_from_twilio_base64(b64_data: str) -> bytes:
-    """Decode base64 audio from 8kHz mono PCM16 frames."""
-    return base64.b64decode(b64_data)
-
-
 def downsample_24k_to_8k_pcm16(pcm24: bytes) -> bytes:
     """24 kHz mono PCM16 -> 8 kHz mono PCM16 using stdlib audioop."""
     converted, _ = audioop.ratecv(pcm24, 2, 1, 24000, 8000, None)
@@ -158,18 +166,30 @@ def upsample_8k_to_24k_pcm16(pcm8: bytes) -> bytes:
     """8 kHz mono PCM16 -> 24 kHz mono PCM16 using stdlib audioop."""
     converted, _ = audioop.ratecv(pcm8, 2, 1, 8000, 24000, None)
     return converted
-from fastapi.responses import PlainTextResponse
-@app.get("/exotel-ws-bootstrap")
 
+
+# ---------------- Bootstrap for Exotel Voicebot ----------------
+
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()  # no protocol
+
+
+@app.get("/exotel-ws-bootstrap")
 async def exotel_ws_bootstrap():
+    """
+    Called by Exotel Voicebot applet (Dynamic WebSocket URL).
+    Returns the wss:// URL pointing back to this service's /exotel-media route.
+    """
     try:
-        base = PUBLIC_BASE_URL or "openai-exotel-sales-prediction.onrender.com"
+        # IMPORTANT: default host aligned with working version
+        base = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-outbound.onrender.com"
         url = f"wss://{base}/exotel-media"
         logger.info("Bootstrap served: %s", url)
         return {"url": url}
     except Exception as e:
         logger.exception("/exotel-ws-bootstrap error: %s", e)
-        return {"url": f"wss://{(PUBLIC_BASE_URL or 'openai-exotel-sales-prediction.onrender.com')}/exotel-media"}
+        fallback = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-outbound.onrender.com"
+        return {"url": f"wss://{fallback}/exotel-media"}
+
 
 # ---------------- Helper: Exotel outbound (Connect API) ----------------
 
@@ -179,11 +199,10 @@ def exotel_outbound_call(to_number: str, caller_id: Optional[str] = None) -> dic
     Trigger an outbound call via Exotel Connect API.
     'to_number' is the customer's phone, 'caller_id' is your Exophone.
 
-    Returns parsed JSON from Exotel.
+    Returns parsed JSON from Exotel, or {"raw": text} on non-JSON response.
     """
     url = exotel_call_url()
     auth = exotel_headers_auth()
-    sid = os.getenv("EXO_SID", "")
     flow_id = os.getenv("EXO_FLOW_ID", "")
     if not flow_id:
         raise RuntimeError("EXO_FLOW_ID is not set")
@@ -191,8 +210,6 @@ def exotel_outbound_call(to_number: str, caller_id: Optional[str] = None) -> dic
     if not caller_id:
         caller_id = os.getenv("EXO_CALLER_ID", "")
 
-    # For "connect", Exotel expects fields like:
-    # To, CallerId, CallType, TimeLimit, etc.
     payload = {
         "From": to_number,
         "To": caller_id,  # your Exophone
@@ -204,12 +221,14 @@ def exotel_outbound_call(to_number: str, caller_id: Optional[str] = None) -> dic
     resp = requests.post(url, data=payload, auth=auth, timeout=30)
     resp.raise_for_status()
     try:
-        return resp.json()
+        data = resp.json()
     except Exception:
-        return {"raw": resp.text}
+        data = {"raw": resp.text}
+    logger.info("Exotel outbound call result: %s", data)
+    return data
 
 
-# ---------------- OpenAI ENV ----------------
+# ---------------- OpenAI / MCP ENV ----------------
 OPENAI_API_KEY = (
     os.getenv("OPENAI_API_KEY")
     or os.getenv("OpenAI_Key")
@@ -219,8 +238,6 @@ REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
 
 LIC_CRM_MCP_BASE_URL = os.getenv("LIC_CRM_MCP_BASE_URL", "").rstrip("/")
 
-# ---------------- Misc ENV ----------------
-PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()  # no protocol
 SAVE_TTS_WAV = bool(int(os.getenv("SAVE_TTS_WAV", "0")))
 
 
@@ -231,11 +248,11 @@ def public_url(path: str) -> str:
     return f"https://{host.rstrip('/')}{path}"
 
 
-# ---------------- TTS placeholder (if needed) ----------------
+# ---------------- TTS placeholder (optional) ----------------
 
 def make_tts(text: str) -> bytes:
     """
-    Placeholder TTS: for now we are streaming from Realtime.
+    Placeholder TTS: for now we are streaming audio from Realtime.
     This is kept only if you later want pre-generated TTS.
     """
     logger.info("make_tts called with text: %s", text)
@@ -254,13 +271,10 @@ class OutboundCallRequest(BaseModel):
 async def exotel_outbound_call_api(req: OutboundCallRequest):
     """
     Trigger an outbound call via Exotel Connect API.
-    Exotel should be configured so the flow eventually uses
-    a "Connect to Websocket" or TwiML Stream to /exotel-media
-    (this app).
+    Exotel Voicebot flow should eventually connect WebSocket to /exotel-media.
     """
     try:
         result = exotel_outbound_call(req.to_number)
-        logger.info("Exotel outbound call result: %s", result)
         return JSONResponse({"status": "ok", "exotel": result})
     except Exception as e:
         logger.exception("Error placing outbound call to Exotel")
@@ -273,7 +287,7 @@ async def exotel_status(request: Request):
     """
     Exotel status webhook:
       - Called at different stages (ringing, answered, completed).
-      - We'll save basic call details into SQLite call_logs.
+      - Saves basic call details into SQLite call_logs.
     """
     form = await request.form()
     data = dict(form)
@@ -311,13 +325,13 @@ async def exotel_status(request: Request):
     return PlainTextResponse("OK")
 
 
-# ---------------- Simple CSV + dashboard ----------------
+# ---------------- Simple dashboard (logs + CSV upload) ----------------
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-  <title>LIC Outbound Dashboard</title>
+  <title>LIC Outbound Calls Dashboard</title>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -481,7 +495,6 @@ async def upload_leads(file: UploadFile = File(...)):
     f = io.StringIO(text)
     reader = csv.reader(f)
 
-    # Attempt to skip header if it looks like one
     leads = []
     for row in reader:
         if not row or len(row) < 2:
@@ -538,12 +551,12 @@ async def upload_leads(file: UploadFile = File(...)):
     return JSONResponse({"status": "ok", "results": results})
 
 
-# ---------------- Realtime media bridge (Exotel <-> OpenAI LIC Agent via MCP) ----------------
+# ---------------- Realtime media bridge (Exotel <-> OpenAI via MCP) ----------------
 @app.websocket("/exotel-media")
 async def exotel_media_ws(ws: WebSocket):
     """
     Exotel <-> OpenAI Realtime bridge for outbound LIC agent (Shashinath Thakur),
-    now using MCP tool-calls (save_call_summary) instead of local summariser.
+    using MCP tool-calls (save_call_summary) instead of local summariser.
     """
     await ws.accept()
     logger.info("Exotel WS connected (Shashinath LIC agent, realtime)")
@@ -565,12 +578,9 @@ async def exotel_media_ws(ws: WebSocket):
     start_ts = time.time()
 
     # OpenAI Realtime session
-    openai_session: Optional[httpx.AsyncClient] = None  # Actually aiohttp.ClientSession originally; adjust if needed
-    openai_session = None
+    openai_session: Optional[ClientSession] = None
     openai_ws = None
     pump_task: Optional[asyncio.Task] = None
-
-    from aiohttp import ClientSession, WSMsgType  # ensure these are imported
 
     async def send_openai(payload: dict):
         """Send JSON payload to OpenAI Realtime WS."""
@@ -902,8 +912,7 @@ async def exotel_media_ws(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
-        # No local summariser here; summary is handled by MCP save_call_summary tool.
-
+        # Summary is handled by MCP save_call_summary tool.
 
 # --------------- Simple index ---------------
 @app.get("/")
@@ -919,7 +928,7 @@ async def index():
   <ul>
     <li><code>POST /exotel-outbound-call</code> – trigger outbound call</li>
     <li><code>POST /exotel-status</code> – Exotel status webhook</li>
-    <li><code>/exotel-media</code> – Exotel WebSocket media <-> OpenAI Realtime</li>
+    <li><code>/exotel-media</code> – Exotel WebSocket media &lt;-&gt; OpenAI Realtime</li>
     <li><code>/dashboard</code> – basic call logs dashboard</li>
   </ul>
 </body>
