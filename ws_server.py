@@ -180,9 +180,11 @@ async def exotel_ws_bootstrap():
     Returns the wss:// URL pointing back to this service's /exotel-media route.
     """
     try:
+        logger.info("0.1", PUBLIC_BASE_URL)
         # IMPORTANT: default host aligned with working version
         base = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-outbound.onrender.com"
         url = f"wss://{base}/exotel-media"
+        logger.info("0.2")
         logger.info("Bootstrap served: %s", url)
         return {"url": url}
     except Exception as e:
