@@ -201,6 +201,7 @@ def exotel_outbound_call(to_number: str, caller_id: Optional[str] = None) -> dic
 
     Returns parsed JSON from Exotel, or {"raw": text} on non-JSON response.
     """
+    logger.info("Step 1.2")
     url = exotel_call_url()
     auth = exotel_headers_auth()
     flow_id = os.getenv("EXO_FLOW_ID", "")
@@ -216,7 +217,7 @@ def exotel_outbound_call(to_number: str, caller_id: Optional[str] = None) -> dic
         "CallerId": caller_id,
         "Url": f"http://my.exotel.com/Exotel/exoml/start/{flow_id}",
     }
-
+    logger.info("Step 1.3")
     logger.info("Exotel outbound call payload: %s", payload)
     resp = requests.post(url, data=payload, auth=auth, timeout=30)
     resp.raise_for_status()
@@ -225,6 +226,7 @@ def exotel_outbound_call(to_number: str, caller_id: Optional[str] = None) -> dic
     except Exception:
         data = {"raw": resp.text}
     logger.info("Exotel outbound call result: %s", data)
+    logger.info("Step 1.4")
     return data
 
 
@@ -274,7 +276,9 @@ async def exotel_outbound_call_api(req: OutboundCallRequest):
     Exotel Voicebot flow should eventually connect WebSocket to /exotel-media.
     """
     try:
+        logger.info("Step 1")
         result = exotel_outbound_call(req.to_number)
+        logger.info("Step 1.1")
         return JSONResponse({"status": "ok", "exotel": result})
     except Exception as e:
         logger.exception("Error placing outbound call to Exotel")
