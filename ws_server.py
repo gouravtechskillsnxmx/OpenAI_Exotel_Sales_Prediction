@@ -180,7 +180,7 @@ async def exotel_ws_bootstrap():
     Returns the wss:// URL pointing back to this service's /exotel-media route.
     """
     try:
-        logger.info("0.1", PUBLIC_BASE_URL)
+        logger.info("0.1 PUBLIC_BASE_URL=%s", PUBLIC_BASE_URL)
         # IMPORTANT: default host aligned with working version
         base = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-outbound.onrender.com"
         url = f"wss://{base}/exotel-media"
@@ -238,7 +238,8 @@ OPENAI_API_KEY = (
     or os.getenv("OpenAI_Key")
     or os.getenv("OPENAI_KEY", "")
 )
-REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+# Default changed to gpt-4o-realtime-preview as discussed
+REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 
 LIC_CRM_MCP_BASE_URL = os.getenv("LIC_CRM_MCP_BASE_URL", "").rstrip("/")
 
@@ -578,6 +579,8 @@ async def exotel_media_ws(ws: WebSocket):
         await ws.close()
         return
 
+    logger.info("Using realtime model: %s", REALTIME_MODEL)
+
     # Exotel stream sequence/timing
     seq_num = 1
     chunk_num = 1
@@ -658,7 +661,7 @@ async def exotel_media_ws(ws: WebSocket):
             url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
             openai_session = ClientSession()
-            logger.info("Connecting to OpenAI Realtime WS...")
+            logger.info("Connecting to OpenAI Realtime WS at %s ...", url)
             openai_ws = await openai_session.ws_connect(url, headers=headers)
             logger.info("Connected to OpenAI WS")
 
