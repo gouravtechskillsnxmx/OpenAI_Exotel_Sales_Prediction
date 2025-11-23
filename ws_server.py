@@ -3,7 +3,7 @@ ws_server.py — Exotel Outbound Realtime LIC Agent + Call Logs + Leads + MCP
 
 Features:
 - Outbound calls via Exotel Connect API to a Voicebot App/Flow (EXO_FLOW_ID)
-- Realtime LIC insurance agent voicebot using OpenAI Realtime
+- Realtime LIC insurance agent voicebot using OpenAI Realtime (gpt-4o-realtime-preview)
 - MCP-backed call summary using Realtime function tool-calls (save_call_summary)
 - Exotel status webhook saving call details into SQLite
 - Leads table + CSV upload to trigger outbound calls
@@ -20,7 +20,7 @@ ENV (set in Render):
   EXO_CALLER_ID     your Exophone, e.g. 09513886363
 
   OPENAI_API_KEY or OpenAI_Key or OPENAI_KEY
-  OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview   (recommended)
+  OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview
 
   PUBLIC_BASE_URL   e.g. openai-exotel-sales-prediction.onrender.com
   LOG_LEVEL=DEBUG   (for full trace) or INFO
@@ -39,7 +39,7 @@ import logging
 import os
 import sqlite3
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 import audioop
 import httpx
@@ -548,7 +548,10 @@ async def exotel_media_ws(ws: WebSocket):
     async def send_openai(payload: dict):
         nonlocal openai_ws
         if not openai_ws or openai_ws.closed:
-            logger.warning("LOG_POINT_013: Cannot send to OpenAI: WS not ready, payload_type=%s", payload.get("type"))
+            logger.warning(
+                "LOG_POINT_013: Cannot send to OpenAI: WS not ready, payload_type=%s",
+                payload.get("type"),
+            )
             return
         t = payload.get("type")
         logger.debug("→ OpenAI SEND: %s", t)
@@ -764,23 +767,52 @@ async def exotel_media_ws(ws: WebSocket):
                         et = evt.get("type")
                         logger.debug("OpenAI EVENT: %s - %s", et, evt)
 
-                        # Audio deltas from model
-                        if et in ("response.audio.delta", "response.output_audio.delta"):
-                            delta = evt.get("delta") or evt.get("audio") or {}
-                            b64 = delta.get("audio") or delta.get("data")
-                            if not b64:
+                        # Audio deltas from model (robust handling for gpt-4o-realtime-preview)
+                        if et in ("response.audio.delta", "response.output_audio.delta", "response.delta"):
+                            delta = evt.get("delta")
+                            audio_b64 = None
+
+                            # CASE A: delta is string -> text delta, ignore for audio
+                            if isinstance(delta, str):
+                                logger.debug("LOG_POINT_FIX01: Received text delta, ignoring for audio")
+                                # still might have direct audio field on evt?
+                                delta = None
+
+                            # CASE B: delta is dict
+                            if isinstance(delta, dict):
+                                # Most common: {"audio": "..."} or {"data": "..."}
+                                audio_b64 = delta.get("audio") or delta.get("data")
+
+                                # Some variants wrap content as list
+                                if not audio_b64 and "content" in delta:
+                                    content = delta.get("content") or []
+                                    if isinstance(content, list):
+                                        for part in content:
+                                            if not isinstance(part, dict):
+                                                continue
+                                            # either explicit audio field or inside 'data'
+                                            audio_b64 = part.get("audio") or part.get("data")
+                                            if audio_b64:
+                                                break
+
+                            # CASE C: model might put audio directly on evt
+                            if not audio_b64:
+                                audio_b64 = evt.get("audio") or evt.get("data")
+
+                            if not audio_b64:
+                                logger.debug("LOG_POINT_FIX02: No audio found in delta/event, skipping")
                                 continue
 
                             try:
-                                pcm24 = base64.b64decode(b64)
+                                pcm24 = base64.b64decode(audio_b64)
                             except Exception:
-                                logger.exception("LOG_POINT_081: Failed to decode audio delta")
+                                logger.exception("LOG_POINT_FIX04: Failed decoding audio")
                                 continue
 
                             try:
                                 pcm8 = downsample_24k_to_8k_pcm16(pcm24)
                             except Exception:
-                                logger.exception("LOG_POINT_082: Downsampling 24k -> 8k failed")
+                                logger.exception("LOG_POINT_FIX05: Downsample 24k->8k failed")
                                 continue
 
                             await send_audio_to_exotel(pcm8)
