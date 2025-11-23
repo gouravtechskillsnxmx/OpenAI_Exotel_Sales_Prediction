@@ -4,7 +4,7 @@ ws_server.py — Exotel Outbound Realtime LIC Agent + Call Logs + Leads + MCP
 Features:
 - Outbound calls via Exotel Connect API to a Voicebot App/Flow (EXO_FLOW_ID)
 - Realtime LIC insurance agent voicebot using OpenAI Realtime
-- MCP-backed call summary using Realtime tool-calls (save_call_summary)
+- MCP-backed call summary using Realtime function tool-calls (save_call_summary)
 - Exotel status webhook saving call details into SQLite
 - Leads table + CSV upload to trigger outbound calls
 - Simple dashboard at /dashboard:
@@ -20,10 +20,10 @@ ENV (set in Render):
   EXO_CALLER_ID     your Exophone, e.g. 09513886363
 
   OPENAI_API_KEY or OpenAI_Key or OPENAI_KEY
-  OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview (recommended)
+  OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview   (recommended)
 
   PUBLIC_BASE_URL   e.g. openai-exotel-sales-prediction.onrender.com
-  LOG_LEVEL=INFO
+  LOG_LEVEL=DEBUG   (for full trace) or INFO
 
   DB_PATH=/tmp/call_logs.db   (or /data/call_logs.db if you have persistent disk)
 
@@ -39,7 +39,7 @@ import logging
 import os
 import sqlite3
 import time
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import audioop
 import httpx
@@ -56,10 +56,6 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
-
-# Optional: these were in your original file; keep if installed
-import numpy as np  # noqa: F401
-from scipy.signal import resample  # noqa: F401
 
 # ---------------- Logging ----------------
 level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -122,11 +118,11 @@ app = FastAPI(title="Outbound LIC Voicebot")
 
 app.add_middleware(
     CORSMiddleware,
-        allow_origins=["*"],  # For demo; restrict in production
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    allow_origins=["*"],  # For demo; restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------- Exotel Helpers ----------------
 
@@ -178,13 +174,13 @@ async def exotel_ws_bootstrap():
     Returns the wss:// URL pointing back to this service's /exotel-media route.
     """
     try:
-        logger.info("0.1 PUBLIC_BASE_URL=%s", PUBLIC_BASE_URL)
+        logger.info("LOG_POINT_001: /exotel-ws-bootstrap hit, PUBLIC_BASE_URL=%s", PUBLIC_BASE_URL)
         base = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-outbound.onrender.com"
         url = f"wss://{base}/exotel-media"
-        logger.info("Bootstrap served: %s", url)
+        logger.info("LOG_POINT_002: Bootstrap served URL=%s", url)
         return {"url": url}
     except Exception as e:
-        logger.exception("/exotel-ws-bootstrap error: %s", e)
+        logger.exception("LOG_POINT_003: /exotel-ws-bootstrap error: %s", e)
         fallback = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-outbound.onrender.com"
         return {"url": f"wss://{fallback}/exotel-media"}
 
@@ -199,7 +195,7 @@ def exotel_outbound_call(to_number: str, caller_id: Optional[str] = None) -> dic
 
     Returns parsed JSON from Exotel, or {"raw": text} on non-JSON response.
     """
-    logger.info("Step 1.2")
+    logger.info("LOG_POINT_100: exotel_outbound_call called to_number=%s", to_number)
     url = exotel_call_url()
     auth = exotel_headers_auth()
     flow_id = os.getenv("EXO_FLOW_ID", "")
@@ -215,16 +211,14 @@ def exotel_outbound_call(to_number: str, caller_id: Optional[str] = None) -> dic
         "CallerId": caller_id,
         "Url": f"http://my.exotel.com/Exotel/exoml/start/{flow_id}",
     }
-    logger.info("Step 1.3")
-    logger.info("Exotel outbound call payload: %s", payload)
+    logger.info("LOG_POINT_101: Exotel outbound call payload: %s", payload)
     resp = requests.post(url, data=payload, auth=auth, timeout=30)
     resp.raise_for_status()
     try:
         data = resp.json()
     except Exception:
         data = {"raw": resp.text}
-    logger.info("Exotel outbound call result: %s", data)
-    logger.info("Step 1.4")
+    logger.info("LOG_POINT_102: Exotel outbound call result: %s", data)
     return data
 
 
@@ -237,13 +231,6 @@ OPENAI_API_KEY = (
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 
 LIC_CRM_MCP_BASE_URL = os.getenv("LIC_CRM_MCP_BASE_URL", "").rstrip("/")
-
-
-def public_url(path: str) -> str:
-    host = PUBLIC_BASE_URL
-    if not host:
-        return ""
-    return f"https://{host.rstrip('/')}{path}"
 
 
 # ---------------- TTS placeholder (optional) ----------------
@@ -264,12 +251,11 @@ class OutboundCallRequest(BaseModel):
 @app.post("/exotel-outbound-call")
 async def exotel_outbound_call_api(req: OutboundCallRequest):
     try:
-        logger.info("Step 1")
+        logger.info("LOG_POINT_110: /exotel-outbound-call hit, body=%s", req.dict())
         result = exotel_outbound_call(req.to_number)
-        logger.info("Step 1.1")
         return JSONResponse({"status": "ok", "exotel": result})
     except Exception as e:
-        logger.exception("Error placing outbound call to Exotel")
+        logger.exception("LOG_POINT_111: Error placing outbound call to Exotel")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 
@@ -278,7 +264,7 @@ async def exotel_outbound_call_api(req: OutboundCallRequest):
 async def exotel_status(request: Request):
     form = await request.form()
     data = dict(form)
-    logger.info("Exotel status webhook payload: %s", data)
+    logger.info("LOG_POINT_120: Exotel status webhook payload: %s", data)
 
     call_sid = data.get("CallSid") or data.get("Sid") or ""
     frm = data.get("From") or data.get("From[]") or ""
@@ -473,7 +459,7 @@ async def upload_leads(file: UploadFile = File(...)):
             continue
         leads.append((name, phone))
 
-    logger.info("Parsed %d leads from CSV", len(leads))
+    logger.info("LOG_POINT_130: Parsed %d leads from CSV", len(leads))
 
     results = []
     for name, phone in leads:
@@ -509,7 +495,7 @@ async def upload_leads(file: UploadFile = File(...)):
 
             results.append({"name": name, "phone": phone, "status": "ok", "call_sid": call_sid})
         except Exception as e:
-            logger.exception("Error handling lead %s (%s)", name, phone)
+            logger.exception("LOG_POINT_131: Error handling lead %s (%s)", name, phone)
             results.append({"name": name, "phone": phone, "status": "error", "error": str(e)})
 
     return JSONResponse({"status": "ok", "results": results})
@@ -527,7 +513,7 @@ async def exotel_media_ws(ws: WebSocket):
     - We intercept that tool call and forward it to the MCP server's /test-save HTTP endpoint.
     """
     await ws.accept()
-    logger.info("Exotel WS connected (Shashinath LIC agent, realtime)")
+    logger.info("LOG_POINT_010: Exotel WS connected & accepted (LIC agent realtime)")
 
     # --- Call metadata (per stream) ---
     call_id: Optional[str] = None        # Exotel CallSid
@@ -536,11 +522,11 @@ async def exotel_media_ws(ws: WebSocket):
     # -----------------------------------
 
     if not OPENAI_API_KEY:
-        logger.error("No OPENAI_API_KEY; closing Exotel stream.")
+        logger.error("LOG_POINT_011: No OPENAI_API_KEY; closing Exotel stream.")
         await ws.close()
         return
 
-    logger.info("Using realtime model: %s", REALTIME_MODEL)
+    logger.info("LOG_POINT_012: Using realtime model: %s", REALTIME_MODEL)
 
     # Exotel stream sequence/timing
     seq_num = 1
@@ -552,23 +538,31 @@ async def exotel_media_ws(ws: WebSocket):
     openai_ws = None
     pump_task: Optional[asyncio.Task] = None
 
+    # Flags for first occurrences
+    first_media_from_exotel = True
+    first_audio_to_exotel = True
+
     # For tool-call argument streaming
     tool_calls: Dict[str, Dict[str, Any]] = {}
 
     async def send_openai(payload: dict):
         nonlocal openai_ws
         if not openai_ws or openai_ws.closed:
-            logger.warning("Cannot send to OpenAI: WS not ready")
+            logger.warning("LOG_POINT_013: Cannot send to OpenAI: WS not ready, payload_type=%s", payload.get("type"))
             return
         t = payload.get("type")
-        logger.debug("→ OpenAI: %s", t)
+        logger.debug("→ OpenAI SEND: %s", t)
         await openai_ws.send_json(payload)
 
     async def send_audio_to_exotel(pcm8: bytes):
-        nonlocal seq_num, chunk_num, start_ts, stream_sid
+        """
+        Send 8kHz PCM16 audio back to Exotel as media frames.
+        Uses the current stream_sid and sequence counters.
+        """
+        nonlocal seq_num, chunk_num, start_ts, stream_sid, first_audio_to_exotel
 
         if not stream_sid:
-            logger.warning("No stream_sid; cannot send audio to Exotel yet")
+            logger.warning("LOG_POINT_014: No stream_sid; cannot send audio to Exotel yet")
             return
 
         FRAME_BYTES = 320  # 20 ms at 8kHz mono 16-bit
@@ -578,6 +572,10 @@ async def exotel_media_ws(ws: WebSocket):
             chunk_bytes = pcm8[i: i + FRAME_BYTES]
             if not chunk_bytes:
                 continue
+
+            if first_audio_to_exotel:
+                logger.info("LOG_POINT_070: First audio chunk from OpenAI being sent to Exotel")
+                first_audio_to_exotel = False
 
             payload_b64 = base64.b64encode(chunk_bytes).decode("ascii")
             ts = now_ms()
@@ -608,24 +606,24 @@ async def exotel_media_ws(ws: WebSocket):
         """
         Bridge Realtime function tool call -> MCP HTTP endpoint (/test-save).
         """
-        logger.info("Handling tool call: %s args=%s", tool_name, args)
+        logger.info("LOG_POINT_200: Handling tool call: %s args=%s", tool_name, args)
         if tool_name == "save_call_summary":
             if not LIC_CRM_MCP_BASE_URL:
-                logger.warning("LIC_CRM_MCP_BASE_URL not set; cannot forward save_call_summary")
+                logger.warning("LOG_POINT_201: LIC_CRM_MCP_BASE_URL not set; cannot forward save_call_summary")
                 return
             url = f"{LIC_CRM_MCP_BASE_URL}/test-save"
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.post(url, json=args)
                 logger.info(
-                    "save_call_summary forwarded to MCP: status=%s body=%s",
+                    "LOG_POINT_202: save_call_summary forwarded to MCP: status=%s body=%s",
                     resp.status_code,
                     resp.text,
                 )
             except Exception as e:
-                logger.exception("Error calling MCP save_call_summary: %s", e)
+                logger.exception("LOG_POINT_203: Error calling MCP save_call_summary: %s", e)
         else:
-            logger.warning("Unknown tool name from model: %s", tool_name)
+            logger.warning("LOG_POINT_204: Unknown tool name from model: %s", tool_name)
 
     async def connect_openai(conn_call_id: str, conn_caller_number: str):
         nonlocal openai_session, openai_ws, pump_task
@@ -637,11 +635,11 @@ async def exotel_media_ws(ws: WebSocket):
             }
 
             url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
+            logger.info("LOG_POINT_040: Connecting to OpenAI Realtime WS at %s ...", url)
 
             openai_session = ClientSession()
-            logger.info("Connecting to OpenAI Realtime WS at %s ...", url)
             openai_ws = await openai_session.ws_connect(url, headers=headers)
-            logger.info("Connected to OpenAI WS")
+            logger.info("LOG_POINT_041: Connected to OpenAI WS")
 
             # ---------------- LIC persona + tool usage instructions ----------------
             instructions_text = (
@@ -664,7 +662,6 @@ async def exotel_media_ws(ws: WebSocket):
                 "      call_id, phone_number, customer_name (if known), interest_score, intent, next_action, raw_summary.\n"
                 "Do NOT call save_call_summary in the middle of the conversation; only once at the end."
             )
-            # ----------------------------------------------------------------
 
             # Define Realtime tools (function calling)
             tools_spec = [
@@ -724,12 +721,17 @@ async def exotel_media_ws(ws: WebSocket):
                 "instructions": instructions_text,
                 "tools": tools_spec,
             }
+            logger.info(
+                "LOG_POINT_042: Built session_config for realtime (no mcp_servers), model=%s",
+                REALTIME_MODEL,
+            )
 
             # Send initial session.update
             await send_openai({"type": "session.update", "session": session_config})
-            logger.info("Sent session.update with LIC persona + tools config")
+            logger.info("LOG_POINT_050: Sent session.update with LIC persona + tools config to OpenAI")
 
             # Ask the model to start the first greeting turn
+            logger.info("LOG_POINT_060: Sending initial response.create to have model greet caller")
             await send_openai(
                 {
                     "type": "response.create",
@@ -756,7 +758,7 @@ async def exotel_media_ws(ws: WebSocket):
                         try:
                             evt = json.loads(msg.data)
                         except Exception:
-                            logger.exception("Failed to parse OpenAI WS message")
+                            logger.exception("LOG_POINT_080: Failed to parse OpenAI WS message")
                             continue
 
                         et = evt.get("type")
@@ -772,13 +774,13 @@ async def exotel_media_ws(ws: WebSocket):
                             try:
                                 pcm24 = base64.b64decode(b64)
                             except Exception:
-                                logger.exception("Failed to decode audio delta")
+                                logger.exception("LOG_POINT_081: Failed to decode audio delta")
                                 continue
 
                             try:
                                 pcm8 = downsample_24k_to_8k_pcm16(pcm24)
                             except Exception:
-                                logger.exception("Downsampling 24k -> 8k failed")
+                                logger.exception("LOG_POINT_082: Downsampling 24k -> 8k failed")
                                 continue
 
                             await send_audio_to_exotel(pcm8)
@@ -791,7 +793,7 @@ async def exotel_media_ws(ws: WebSocket):
                                 call_id_fc = item.get("call_id") or item.get("id")
                                 if name and call_id_fc:
                                     tool_calls[call_id_fc] = {"name": name, "arguments": ""}
-                                    logger.info("Tool call started: %s (%s)", name, call_id_fc)
+                                    logger.info("LOG_POINT_210: Tool call started: %s (%s)", name, call_id_fc)
 
                         # Streaming function call arguments
                         elif et == "response.function_call_arguments.delta":
@@ -800,7 +802,7 @@ async def exotel_media_ws(ws: WebSocket):
                             if call_id_fc and call_id_fc in tool_calls:
                                 tool_calls[call_id_fc]["arguments"] += delta_args
                                 logger.debug(
-                                    "Accumulating tool args for %s: %s",
+                                    "LOG_POINT_211: Accumulating tool args for %s: %s",
                                     call_id_fc,
                                     delta_args,
                                 )
@@ -811,7 +813,7 @@ async def exotel_media_ws(ws: WebSocket):
                                 name = tool_calls[call_id_fc]["name"]
                                 arg_str = tool_calls[call_id_fc]["arguments"]
                                 logger.info(
-                                    "Tool call done: %s (%s) args=%s",
+                                    "LOG_POINT_212: Tool call done: %s (%s) args=%s",
                                     name,
                                     call_id_fc,
                                     arg_str,
@@ -819,7 +821,7 @@ async def exotel_media_ws(ws: WebSocket):
                                 try:
                                     args = json.loads(arg_str or "{}")
                                 except Exception:
-                                    logger.exception("Failed to parse tool arguments JSON")
+                                    logger.exception("LOG_POINT_213: Failed to parse tool arguments JSON")
                                     args = {}
                                 await handle_tool_call(name, args)
                                 tool_calls.pop(call_id_fc, None)
@@ -829,29 +831,31 @@ async def exotel_media_ws(ws: WebSocket):
                             "response.output_audio.done",
                             "response.done",
                         ):
-                            logger.info("OpenAI response finished.")
+                            logger.info("LOG_POINT_083: OpenAI response finished.")
 
                         elif et == "error":
-                            logger.error("OpenAI ERROR event: %s", evt)
+                            logger.error("LOG_POINT_084: OpenAI ERROR event: %s", evt)
 
                 except Exception as e:
-                    logger.exception("Pump error: %s", e)
+                    logger.exception("LOG_POINT_085: Pump error: %s", e)
 
             pump_task = asyncio.create_task(pump())
 
         except Exception as e:
-            logger.exception("OpenAI connection error: %s", e)
+            logger.exception("LOG_POINT_043: OpenAI connection error: %s", e)
 
     try:
+        logger.info("LOG_POINT_015: Entering Exotel WS main loop")
         openai_started = False
 
         while True:
             raw = await ws.receive_text()
             evt = json.loads(raw)
             ev = evt.get("event")
-            logger.info("Exotel EVENT: %s - msg=%s", ev, evt)
+            logger.info("LOG_POINT_016: Exotel EVENT received: %s - msg=%s", ev, evt)
 
             if ev == "connected":
+                logger.info("LOG_POINT_017: Exotel 'connected' event (handshake)")
                 continue
 
             elif ev == "start":
@@ -868,7 +872,7 @@ async def exotel_media_ws(ws: WebSocket):
                 )
 
                 logger.info(
-                    "Exotel stream started, stream_sid=%s, call_id=%s, from=%s",
+                    "LOG_POINT_020: Exotel 'start' received: stream_sid=%s, call_id=%s, from=%s",
                     stream_sid,
                     call_id,
                     caller_number,
@@ -882,16 +886,22 @@ async def exotel_media_ws(ws: WebSocket):
 
                 if not openai_started:
                     openai_started = True
+                    logger.info("LOG_POINT_021: Calling connect_openai with call_id=%s phone=%s", call_id, caller_number)
                     await connect_openai(call_id or "unknown_call", caller_number or "")
 
             elif ev == "media":
+                # Caller audio (8kHz PCM16) -> upsample to 24kHz -> send to OpenAI
                 media = evt.get("media") or {}
                 payload_b64 = media.get("payload")
+                if first_media_from_exotel:
+                    logger.info("LOG_POINT_025: First Exotel 'media' frame received (audio from caller)")
+                    first_media_from_exotel = False
+
                 if payload_b64 and openai_ws and not openai_ws.closed:
                     try:
                         pcm8 = base64.b64decode(payload_b64)
                     except Exception:
-                        logger.warning("Invalid base64 in Exotel media payload")
+                        logger.warning("LOG_POINT_026: Invalid base64 in Exotel media payload")
                         continue
 
                     pcm24 = upsample_8k_to_24k_pcm16(pcm8)
@@ -902,11 +912,12 @@ async def exotel_media_ws(ws: WebSocket):
                             "audio": audio_b64,
                         }
                     )
+                    logger.debug("LOG_POINT_027: Sent caller audio chunk to OpenAI input_audio_buffer")
                     # server_vad will auto-commit when end-of-speech is detected
 
             elif ev == "stop":
                 logger.info(
-                    "Exotel sent stop; asking model to summarise and call save_call_summary."
+                    "LOG_POINT_030: Exotel sent 'stop'; asking model to summarise and call save_call_summary."
                 )
 
                 meta = CALL_TRANSCRIPTS.get(stream_sid) or {}
@@ -941,6 +952,7 @@ async def exotel_media_ws(ws: WebSocket):
                     }
                 )
                 await send_openai({"type": "response.create"})
+                logger.info("LOG_POINT_031: Sent summarisation instructions + response.create to OpenAI")
 
                 if stream_sid in CALL_TRANSCRIPTS:
                     CALL_TRANSCRIPTS.pop(stream_sid, None)
@@ -948,12 +960,12 @@ async def exotel_media_ws(ws: WebSocket):
                 break
 
             else:
-                logger.warning("Unhandled Exotel event: %s", ev)
+                logger.warning("LOG_POINT_018: Unhandled Exotel event: %s", ev)
 
     except WebSocketDisconnect:
-        logger.info("Exotel WS disconnected")
+        logger.info("LOG_POINT_019: Exotel WS disconnected")
     except Exception as e:
-        logger.exception("Error in exotel_media_ws: %s", e)
+        logger.exception("LOG_POINT_032: Error in exotel_media_ws: %s", e)
     finally:
         if pump_task:
             pump_task.cancel()
