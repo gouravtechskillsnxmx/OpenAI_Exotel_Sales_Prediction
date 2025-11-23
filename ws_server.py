@@ -4,7 +4,7 @@ ws_server.py — Exotel Outbound Realtime LIC Agent + Call Logs + Leads + MCP
 Features:
 - Outbound calls via Exotel Connect API to a Voicebot App/Flow (EXO_FLOW_ID)
 - Realtime LIC insurance agent voicebot using OpenAI Realtime
-- MCP integration (LIC_CRM_MCP_BASE_URL) for save_call_summary tool
+- MCP-backed call summary using Realtime tool-calls (save_call_summary)
 - Exotel status webhook saving call details into SQLite
 - Leads table + CSV upload to trigger outbound calls
 - Simple dashboard at /dashboard:
@@ -22,13 +22,12 @@ ENV (set in Render):
   OPENAI_API_KEY or OpenAI_Key or OPENAI_KEY
   OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview (recommended)
 
-  PUBLIC_BASE_URL   e.g. openai-exotel-elevenlabs-outbound.onrender.com
+  PUBLIC_BASE_URL   e.g. openai-exotel-sales-prediction.onrender.com
   LOG_LEVEL=INFO
 
   DB_PATH=/tmp/call_logs.db   (or /data/call_logs.db if you have persistent disk)
-  SAVE_TTS_WAV=1              (if you want to write TTS wav files under /tmp)
 
-  LIC_CRM_MCP_BASE_URL=https://lic-crm-mcp.onrender.com    (MCP server for saving call summaries)
+  LIC_CRM_MCP_BASE_URL=https://lic-crm-mcp.onrender.com    (MCP server; we call /test-save)
 """
 
 import asyncio
@@ -40,8 +39,7 @@ import logging
 import os
 import sqlite3
 import time
-from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import audioop
 import httpx
@@ -69,7 +67,7 @@ logging.basicConfig(level=getattr(logging, level, logging.INFO))
 logger = logging.getLogger("ws_server")
 
 # ---------------- Global transcript store ----------------
-CALL_TRANSCRIPTS = {}
+CALL_TRANSCRIPTS: Dict[str, Dict[str, Any]] = {}
 
 # ---------------- DB (SQLite) ----------------
 DB_PATH = os.getenv("DB_PATH", "/tmp/call_logs.db")
@@ -123,11 +121,12 @@ init_db()
 app = FastAPI(title="Outbound LIC Voicebot")
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # For demo; restrict in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware(
+        allow_origins=["*"],  # For demo; restrict in production
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 )
 
 # ---------------- Exotel Helpers ----------------
@@ -181,10 +180,8 @@ async def exotel_ws_bootstrap():
     """
     try:
         logger.info("0.1 PUBLIC_BASE_URL=%s", PUBLIC_BASE_URL)
-        # IMPORTANT: default host aligned with working version
         base = PUBLIC_BASE_URL or "openai-exotel-elevenlabs-outbound.onrender.com"
         url = f"wss://{base}/exotel-media"
-        logger.info("0.2")
         logger.info("Bootstrap served: %s", url)
         return {"url": url}
     except Exception as e:
@@ -238,12 +235,9 @@ OPENAI_API_KEY = (
     or os.getenv("OpenAI_Key")
     or os.getenv("OPENAI_KEY", "")
 )
-# Default changed to gpt-4o-realtime-preview as discussed
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 
 LIC_CRM_MCP_BASE_URL = os.getenv("LIC_CRM_MCP_BASE_URL", "").rstrip("/")
-
-SAVE_TTS_WAV = bool(int(os.getenv("SAVE_TTS_WAV", "0")))
 
 
 def public_url(path: str) -> str:
@@ -256,10 +250,6 @@ def public_url(path: str) -> str:
 # ---------------- TTS placeholder (optional) ----------------
 
 def make_tts(text: str) -> bytes:
-    """
-    Placeholder TTS: for now we are streaming audio from Realtime.
-    This is kept only if you later want pre-generated TTS.
-    """
     logger.info("make_tts called with text: %s", text)
     return b""
 
@@ -274,10 +264,6 @@ class OutboundCallRequest(BaseModel):
 
 @app.post("/exotel-outbound-call")
 async def exotel_outbound_call_api(req: OutboundCallRequest):
-    """
-    Trigger an outbound call via Exotel Connect API.
-    Exotel Voicebot flow should eventually connect WebSocket to /exotel-media.
-    """
     try:
         logger.info("Step 1")
         result = exotel_outbound_call(req.to_number)
@@ -291,11 +277,6 @@ async def exotel_outbound_call_api(req: OutboundCallRequest):
 # ---------------- Exotel status webhook ----------------
 @app.post("/exotel-status")
 async def exotel_status(request: Request):
-    """
-    Exotel status webhook:
-      - Called at different stages (ringing, answered, completed).
-      - Saves basic call details into SQLite call_logs.
-    """
     form = await request.form()
     data = dict(form)
     logger.info("Exotel status webhook payload: %s", data)
@@ -340,13 +321,8 @@ DASHBOARD_HTML = """
 <head>
   <title>LIC Outbound Calls Dashboard</title>
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      margin: 20px;
-    }
-    h1, h2 {
-      color: #333;
-    }
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1, h2 { color: #333; }
     .section {
       border: 1px solid #ccc;
       padding: 16px;
@@ -358,13 +334,8 @@ DASHBOARD_HTML = """
       width: 100%%;
       margin-top: 12px;
     }
-    table, th, td {
-      border: 1px solid #ccc;
-    }
-    th, td {
-      padding: 8px;
-      text-align: left;
-    }
+    table, th, td { border: 1px solid #ccc; }
+    th, td { padding: 8px; text-align: left; }
     .btn {
       display: inline-block;
       padding: 8px 12px;
@@ -374,10 +345,6 @@ DASHBOARD_HTML = """
       text-decoration: none;
       border: none;
       cursor: pointer;
-    }
-    .btn:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
     }
     .status-badge {
       display: inline-block;
@@ -436,7 +403,8 @@ async def dashboard():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, call_sid, from_number, to_number, status, recording_url, started_at, ended_at, created_at FROM call_logs ORDER BY id DESC LIMIT 50"
+        "SELECT id, call_sid, from_number, to_number, status, recording_url, "
+        "started_at, ended_at, created_at FROM call_logs ORDER BY id DESC LIMIT 50"
     )
     rows = cur.fetchall()
     conn.close()
@@ -466,10 +434,7 @@ async def dashboard():
         elif "fail" in status_lower:
             status_class = "status-failed"
 
-        if recording_url:
-            rec_link = f'<a href="{recording_url}" target="_blank">Play</a>'
-        else:
-            rec_link = ""
+        rec_link = f'<a href="{recording_url}" target="_blank">Play</a>' if recording_url else ""
 
         body_rows.append(
             f"""
@@ -493,10 +458,6 @@ async def dashboard():
 
 @app.post("/upload-leads")
 async def upload_leads(file: UploadFile = File(...)):
-    """
-    Upload CSV of leads (name,phone) and trigger outbound calls.
-    Very simple demo: we place calls sequentially (no scheduling).
-    """
     content = await file.read()
     text = content.decode("utf-8", errors="ignore")
     f = io.StringIO(text)
@@ -518,7 +479,6 @@ async def upload_leads(file: UploadFile = File(...)):
     results = []
     for name, phone in leads:
         try:
-            # Insert lead into DB
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
             cur.execute(
@@ -532,11 +492,9 @@ async def upload_leads(file: UploadFile = File(...)):
             conn.commit()
             conn.close()
 
-            # Trigger Exotel call
             result = exotel_outbound_call(phone)
             call_sid = result.get("Call", {}).get("Sid") if isinstance(result, dict) else None
 
-            # Update lead record with call_sid, status
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
             cur.execute(
@@ -558,12 +516,16 @@ async def upload_leads(file: UploadFile = File(...)):
     return JSONResponse({"status": "ok", "results": results})
 
 
-# ---------------- Realtime media bridge (Exotel <-> OpenAI via MCP) ----------------
+# ---------------- Realtime media bridge (Exotel <-> OpenAI via MCP-backed tool) ----------------
 @app.websocket("/exotel-media")
 async def exotel_media_ws(ws: WebSocket):
     """
-    Exotel <-> OpenAI Realtime bridge for outbound LIC agent (Shashinath Thakur),
-    using MCP tool-calls (save_call_summary) instead of local summariser.
+    Exotel <-> OpenAI Realtime bridge for outbound LIC agent (Shashinath Thakur).
+
+    - Streams caller audio to OpenAI Realtime (gpt-4o-realtime-preview).
+    - Streams model audio back to Exotel.
+    - At call end, the model calls the `save_call_summary` function tool.
+    - We intercept that tool call and forward it to the MCP server's /test-save HTTP endpoint.
     """
     await ws.accept()
     logger.info("Exotel WS connected (Shashinath LIC agent, realtime)")
@@ -591,8 +553,10 @@ async def exotel_media_ws(ws: WebSocket):
     openai_ws = None
     pump_task: Optional[asyncio.Task] = None
 
+    # For tool-call argument streaming
+    tool_calls: Dict[str, Dict[str, Any]] = {}
+
     async def send_openai(payload: dict):
-        """Send JSON payload to OpenAI Realtime WS."""
         nonlocal openai_ws
         if not openai_ws or openai_ws.closed:
             logger.warning("Cannot send to OpenAI: WS not ready")
@@ -602,10 +566,6 @@ async def exotel_media_ws(ws: WebSocket):
         await openai_ws.send_json(payload)
 
     async def send_audio_to_exotel(pcm8: bytes):
-        """
-        Send 8kHz PCM16 audio back to Exotel as media frames.
-        Uses the current stream_sid and sequence counters.
-        """
         nonlocal seq_num, chunk_num, start_ts, stream_sid
 
         if not stream_sid:
@@ -645,11 +605,30 @@ async def exotel_media_ws(ws: WebSocket):
             seq_num += 1
             chunk_num += 1
 
+    async def handle_tool_call(tool_name: str, args: Dict[str, Any]):
+        """
+        Bridge Realtime function tool call -> MCP HTTP endpoint (/test-save).
+        """
+        logger.info("Handling tool call: %s args=%s", tool_name, args)
+        if tool_name == "save_call_summary":
+            if not LIC_CRM_MCP_BASE_URL:
+                logger.warning("LIC_CRM_MCP_BASE_URL not set; cannot forward save_call_summary")
+                return
+            url = f"{LIC_CRM_MCP_BASE_URL}/test-save"
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(url, json=args)
+                logger.info(
+                    "save_call_summary forwarded to MCP: status=%s body=%s",
+                    resp.status_code,
+                    resp.text,
+                )
+            except Exception as e:
+                logger.exception("Error calling MCP save_call_summary: %s", e)
+        else:
+            logger.warning("Unknown tool name from model: %s", tool_name)
+
     async def connect_openai(conn_call_id: str, conn_caller_number: str):
-        """
-        Connect to OpenAI Realtime, configure LIC persona + MCP server,
-        and start the pump() loop that sends audio back to Exotel.
-        """
         nonlocal openai_session, openai_ws, pump_task
 
         try:
@@ -665,7 +644,7 @@ async def exotel_media_ws(ws: WebSocket):
             openai_ws = await openai_session.ws_connect(url, headers=headers)
             logger.info("Connected to OpenAI WS")
 
-            # ---------------- LIC persona + MCP instructions ----------------
+            # ---------------- LIC persona + tool usage instructions ----------------
             instructions_text = (
                 "You are Mr. Shashinath Thakur, a senior LIC insurance agent from India. "
                 "You speak in friendly Hinglish (mix of Hindi and English), calm and trustworthy, "
@@ -676,10 +655,10 @@ async def exotel_media_ws(ws: WebSocket):
                 "2. Ask short, clear questions to understand their LIC needs (term plan, money-back, child plan, etc.).\n"
                 "3. Explain policies simply: premium, cover amount, term, tax benefit, riders, and claim process.\n"
                 "4. Always keep answers short (1–2 sentences) and then ask ONE follow-up question, "
-                "then wait silently for the caller to speak.\n"
+                "   then wait silently for the caller to speak.\n"
                 "5. Never talk about topics outside LIC insurance and basic financial planning.\n\n"
-                "MCP TOOL USAGE (VERY IMPORTANT):\n"
-                "- You have a tool `save_call_summary` available via an MCP server.\n"
+                "TOOL USAGE (VERY IMPORTANT):\n"
+                "- You have a function tool `save_call_summary`.\n"
                 "- When the phone call is clearly ending (final goodbye), you MUST:\n"
                 "  (a) Infer: intent, interest_score (0–10), next_action, and a 3–6 sentence raw_summary.\n"
                 "  (b) Call `save_call_summary` exactly once with:\n"
@@ -688,33 +667,68 @@ async def exotel_media_ws(ws: WebSocket):
             )
             # ----------------------------------------------------------------
 
+            # Define Realtime tools (function calling)
+            tools_spec = [
+                {
+                    "type": "function",
+                    "name": "save_call_summary",
+                    "description": "Persist a structured LIC call summary into the CRM.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "call_id": {
+                                "type": "string",
+                                "description": "Unique call id (e.g. Exotel CallSid).",
+                            },
+                            "phone_number": {
+                                "type": "string",
+                                "description": "Customer phone number.",
+                            },
+                            "customer_name": {
+                                "type": "string",
+                                "description": "Customer name if known, else empty.",
+                            },
+                            "interest_score": {
+                                "type": "integer",
+                                "description": "0–10 score of interest in buying LIC.",
+                            },
+                            "intent": {
+                                "type": "string",
+                                "description": "Intent label: buy_term, renew, info_only, not_interested, other.",
+                            },
+                            "next_action": {
+                                "type": "string",
+                                "description": "follow_up, whatsapp_quote, no_contact, other.",
+                            },
+                            "raw_summary": {
+                                "type": "string",
+                                "description": "3–6 sentence natural language summary of the full call.",
+                            },
+                        },
+                        "required": [
+                            "call_id",
+                            "phone_number",
+                            "interest_score",
+                            "intent",
+                            "next_action",
+                            "raw_summary",
+                        ],
+                    },
+                }
+            ]
+
             session_config: dict = {
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
                 "voice": "alloy",
                 "turn_detection": {"type": "server_vad"},
                 "instructions": instructions_text,
+                "tools": tools_spec,
             }
 
-            # Attach MCP server if configured
-            if LIC_CRM_MCP_BASE_URL:
-                session_config["mcp_servers"] = [
-                    {
-                        "id": "lic-crm-mcp",
-                        "url": f"{LIC_CRM_MCP_BASE_URL}/mcp",
-                    }
-                ]
-            else:
-                logger.warning("LIC_CRM_MCP_BASE_URL not set; MCP tools unavailable for this call")
-
             # Send initial session.update
-            await send_openai(
-                {
-                    "type": "session.update",
-                    "session": session_config,
-                }
-            )
-            logger.info("Sent session.update with LIC persona + MCP config")
+            await send_openai({"type": "session.update", "session": session_config})
+            logger.info("Sent session.update with LIC persona + tools config")
 
             # Ask the model to start the first greeting turn
             await send_openai(
@@ -731,7 +745,9 @@ async def exotel_media_ws(ws: WebSocket):
 
             async def pump():
                 """
-                Receive events from OpenAI Realtime and forward audio deltas to Exotel.
+                Receive events from OpenAI Realtime and:
+                  - forward audio deltas to Exotel
+                  - capture tool calls and forward them to MCP HTTP endpoint
                 """
                 try:
                     async for msg in openai_ws:
@@ -760,7 +776,6 @@ async def exotel_media_ws(ws: WebSocket):
                                 logger.exception("Failed to decode audio delta")
                                 continue
 
-                            # Downsample 24kHz -> 8kHz for Exotel
                             try:
                                 pcm8 = downsample_24k_to_8k_pcm16(pcm24)
                             except Exception:
@@ -768,6 +783,47 @@ async def exotel_media_ws(ws: WebSocket):
                                 continue
 
                             await send_audio_to_exotel(pcm8)
+
+                        # Function call item added
+                        elif et == "response.output_item.added":
+                            item = evt.get("item") or {}
+                            if item.get("type") == "function_call":
+                                name = item.get("name")
+                                call_id_fc = item.get("call_id") or item.get("id")
+                                if name and call_id_fc:
+                                    tool_calls[call_id_fc] = {"name": name, "arguments": ""}
+                                    logger.info("Tool call started: %s (%s)", name, call_id_fc)
+
+                        # Streaming function call arguments
+                        elif et == "response.function_call_arguments.delta":
+                            call_id_fc = evt.get("call_id")
+                            delta_args = evt.get("arguments_delta") or ""
+                            if call_id_fc and call_id_fc in tool_calls:
+                                tool_calls[call_id_fc]["arguments"] += delta_args
+                                logger.debug(
+                                    "Accumulating tool args for %s: %s",
+                                    call_id_fc,
+                                    delta_args,
+                                )
+
+                        elif et == "response.function_call_arguments.done":
+                            call_id_fc = evt.get("call_id")
+                            if call_id_fc and call_id_fc in tool_calls:
+                                name = tool_calls[call_id_fc]["name"]
+                                arg_str = tool_calls[call_id_fc]["arguments"]
+                                logger.info(
+                                    "Tool call done: %s (%s) args=%s",
+                                    name,
+                                    call_id_fc,
+                                    arg_str,
+                                )
+                                try:
+                                    args = json.loads(arg_str or "{}")
+                                except Exception:
+                                    logger.exception("Failed to parse tool arguments JSON")
+                                    args = {}
+                                await handle_tool_call(name, args)
+                                tool_calls.pop(call_id_fc, None)
 
                         elif et in (
                             "response.audio.done",
@@ -797,7 +853,6 @@ async def exotel_media_ws(ws: WebSocket):
             logger.info("Exotel EVENT: %s - msg=%s", ev, evt)
 
             if ev == "connected":
-                # initial handshake from Exotel
                 continue
 
             elif ev == "start":
@@ -820,11 +875,10 @@ async def exotel_media_ws(ws: WebSocket):
                     caller_number,
                 )
 
-                # Optional: init transcript store for this call (can fill later)
                 CALL_TRANSCRIPTS[stream_sid] = {
                     "call_id": call_id,
                     "phone_number": caller_number,
-                    "turns": [],  # list of (speaker, text)
+                    "turns": [],
                 }
 
                 if not openai_started:
@@ -832,7 +886,6 @@ async def exotel_media_ws(ws: WebSocket):
                     await connect_openai(call_id or "unknown_call", caller_number or "")
 
             elif ev == "media":
-                # Caller audio (8kHz PCM16) -> upsample to 24kHz -> send to OpenAI
                 media = evt.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64 and openai_ws and not openai_ws.closed:
@@ -850,18 +903,17 @@ async def exotel_media_ws(ws: WebSocket):
                             "audio": audio_b64,
                         }
                     )
-                    # NOTE: With server_vad we do NOT call input_audio_buffer.commit manually.
-                    # The server will commit automatically when it detects end-of-speech.
+                    # server_vad will auto-commit when end-of-speech is detected
 
             elif ev == "stop":
-                logger.info("Exotel sent stop; instructing model to summarise via MCP tool-call and closing WS.")
+                logger.info(
+                    "Exotel sent stop; asking model to summarise and call save_call_summary."
+                )
 
-                # Fetch metadata
                 meta = CALL_TRANSCRIPTS.get(stream_sid) or {}
                 meta_call_id = meta.get("call_id") or call_id or (stream_sid or "unknown_call")
                 meta_phone = meta.get("phone_number") or caller_number or ""
 
-                # Ask model to summarise and call save_call_summary once
                 await send_openai(
                     {
                         "type": "conversation.item.create",
@@ -873,8 +925,8 @@ async def exotel_media_ws(ws: WebSocket):
                                     "type": "input_text",
                                     "text": (
                                         "The phone call has now ended. "
-                                        "Please summarise the entire call and then invoke the "
-                                        "`save_call_summary` tool exactly once with:\n"
+                                        "Summarise the entire call and then invoke the "
+                                        "`save_call_summary` function tool exactly once with:\n"
                                         f"- call_id = {meta_call_id}\n"
                                         f"- phone_number = {meta_phone}\n"
                                         "- customer_name (if known)\n"
@@ -891,7 +943,6 @@ async def exotel_media_ws(ws: WebSocket):
                 )
                 await send_openai({"type": "response.create"})
 
-                # Clean up local memory
                 if stream_sid in CALL_TRANSCRIPTS:
                     CALL_TRANSCRIPTS.pop(stream_sid, None)
 
@@ -921,7 +972,7 @@ async def exotel_media_ws(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
-        # Summary is handled by MCP save_call_summary tool.
+
 
 # --------------- Simple index ---------------
 @app.get("/")
@@ -942,11 +993,10 @@ async def index():
   </ul>
 </body>
 </html>
-    """
+        """
     )
 
 
-# --------------- Run locally ---------------
 if __name__ == "__main__":
     import uvicorn
 
