@@ -121,13 +121,12 @@ init_db()
 app = FastAPI(title="Outbound LIC Voicebot")
 
 app.add_middleware(
-    CORSMiddleware(
+    CORSMiddleware,
         allow_origins=["*"],  # For demo; restrict in production
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-)
 
 # ---------------- Exotel Helpers ----------------
 
