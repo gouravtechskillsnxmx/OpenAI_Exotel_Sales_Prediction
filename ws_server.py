@@ -132,6 +132,53 @@ def init_db() -> None:
 init_db()
 
 # ---------------------------------------------------------
+# MCP test helper (legacy; can be used manually if needed)
+# ---------------------------------------------------------
+
+async def send_call_summary_to_mcp(
+    call_id: str,
+    phone_number: str,
+    customer_name: str,
+    interest_score: int,
+    intent: str,
+    next_action: str,
+    raw_summary: str,
+) -> None:
+    """
+    Call the LIC CRM MCP server's /test-save HTTP endpoint to write into
+    the call_summaries table (via _save_call_summary_impl in lic_crm_mcp_server.py).
+
+    Expects LIC_CRM_MCP_BASE_URL env var, e.g.
+      LIC_CRM_MCP_BASE_URL=https://lic-crm-mcp.onrender.com
+
+    NOTE: For real summaries we use forward_save_call_summary_to_mcp()
+    from inside the Realtime tool handler. This helper is mainly for ad-hoc tests.
+    """
+    if not LIC_CRM_MCP_BASE_URL:
+        logger.warning("LIC_CRM_MCP_BASE_URL not set; skipping MCP call.")
+        return
+
+    url = f"{LIC_CRM_MCP_BASE_URL}/test-save"
+    payload = {
+        "call_id": call_id,
+        "phone_number": phone_number,
+        "customer_name": customer_name,
+        "interest_score": int(interest_score),
+        "intent": intent,
+        "next_action": next_action,
+        "raw_summary": raw_summary,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            logger.info("Sending call summary to MCP (legacy helper): %s %s", url, payload)
+            r = await client.post(url, json=payload)
+            logger.info("MCP /test-save response: %s %s", r.status_code, r.text)
+    except Exception as e:
+        logger.exception("Error calling MCP /test-save: %s", e)
+
+
+# ---------------------------------------------------------
 # Audio helpers (24k <-> 8k)
 # ---------------------------------------------------------
 
@@ -551,6 +598,8 @@ async def exotel_outbound_call_endpoint(request: Request):
 async def forward_save_call_summary_to_mcp(payload: Dict[str, Any]) -> None:
     """
     Calls LIC_CRM_MCP_BASE_URL/test-save with a JSON body for saving call summary.
+    This is used with REAL summary from the Realtime tool-call:
+      { "call_id": ..., "phone_number": ..., "summary": ... }
     """
     if not LIC_CRM_MCP_BASE_URL:
         logger.warning("LIC_CRM_MCP_BASE_URL not set; cannot forward save_call_summary")
@@ -845,9 +894,9 @@ async def exotel_media(ws: WebSocket):
 
                             await send_audio_to_exotel(pcm8)
 
-                        # Function call item added
+                        # Function call item added (REAL summary path)
                         elif et == "response.output_item.added":
-                            item = (evt.get("item") or {}) or {}
+                            item = evt.get("item") or {}
                             if item.get("type") == "response.function_call":
                                 fc = item.get("function") or {}
                                 tool_name = fc.get("name")
@@ -861,7 +910,11 @@ async def exotel_media(ws: WebSocket):
                                     phone_param = args.get("phone_number") or conn_caller_number
                                     summary_param = args.get("summary") or ""
 
-                                    # Persist into local DB + forward to MCP
+                                    logger.info(
+                                        "REAL SUMMARY RECEIVED FROM MODEL: %s", summary_param
+                                    )
+
+                                    # Persist REAL summary into local DB
                                     conn = sqlite3.connect(DB_PATH)
                                     cur = conn.cursor()
                                     cur.execute(
@@ -879,6 +932,7 @@ async def exotel_media(ws: WebSocket):
                                     conn.commit()
                                     conn.close()
 
+                                    # Forward REAL summary to MCP
                                     await forward_save_call_summary_to_mcp(
                                         {
                                             "call_id": call_id_param,
@@ -985,9 +1039,28 @@ async def exotel_media(ws: WebSocket):
                     # The server will commit automatically when it detects end-of-speech.
 
             elif ev == "stop":
+					   
                 logger.info("Exotel sent stop; closing WS and letting model wrap up.")
 
-                # Fetch metadata
+                # Fetch metadata for minimal record
+																			
+																	
+									  
+
+																						   
+									
+											 
+											 
+												
+												
+										 
+										 
+										   
+																				  
+					 
+				 
+
+													  
                 meta = CALL_TRANSCRIPTS.get(stream_sid) or {}
                 meta_call_id = meta.get("call_id") or call_id or (stream_sid or "unknown_call")
                 meta_phone = meta.get("phone_number") or caller_number or ""
@@ -1004,7 +1077,23 @@ async def exotel_media(ws: WebSocket):
                 )
                 conn.commit()
                 conn.close()
+																				   
+																			
+																	
+									  
 
+																						   
+									
+											 
+											 
+												
+												
+										 
+										 
+										   
+																				  
+					 
+				 
                 break
 
     except WebSocketDisconnect:
