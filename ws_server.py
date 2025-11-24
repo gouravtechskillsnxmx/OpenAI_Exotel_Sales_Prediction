@@ -595,21 +595,39 @@ async def exotel_outbound_call_endpoint(request: Request):
 # MCP helper: forward tool-call results to LIC_CRM_MCP_BASE_URL
 # ---------------------------------------------------------
 
-async def forward_save_call_summary_to_mcp(payload: Dict[str, Any]) -> None:
+async def forward_save_call_summary_to_mcp(call_id: str, phone_number: str, summary: str) -> None:
     """
     Calls LIC_CRM_MCP_BASE_URL/test-save with a JSON body for saving call summary.
-    This is used with REAL summary from the Realtime tool-call:
-      { "call_id": ..., "phone_number": ..., "summary": ... }
+
+    Maps the Realtime tool summary onto the MCP schema:
+      - call_id
+      - phone_number
+      - customer_name      (left blank for now)
+      - intent             (blank; can be classified later)
+      - interest_score     (0; can be scored later)
+      - next_action        (blank; can be derived later)
+      - raw_summary        (the REAL conversation summary)
     """
     if not LIC_CRM_MCP_BASE_URL:
         logger.warning("LIC_CRM_MCP_BASE_URL not set; cannot forward save_call_summary")
         return
+
     url = f"{LIC_CRM_MCP_BASE_URL}/test-save"
+    payload = {
+        "call_id": call_id,
+        "phone_number": phone_number,
+        "customer_name": "",       # you can fill real name later if you capture it
+        "intent": "",
+        "interest_score": 0,
+        "next_action": "",
+        "raw_summary": summary,
+    }
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            logger.info("Forwarding save_call_summary to MCP: %s", url)
+            logger.info("Forwarding REAL call summary to MCP: %s %s", url, payload)
             r = await client.post(url, json=payload)
-            logger.info("MCP response: status=%s body=%s", r.status_code, r.text)
+            logger.info("MCP /test-save response: %s %s", r.status_code, r.text)
     except Exception:
         logger.exception("Error forwarding save_call_summary to MCP server")
 
@@ -651,7 +669,13 @@ async def test_mcp():
     conn.close()
 
     # Forward to MCP (if configured)
-    await forward_save_call_summary_to_mcp(dummy)
+    # Forward to MCP (if configured)
+    await forward_save_call_summary_to_mcp(
+        dummy["call_id"],
+        dummy["phone_number"],
+        dummy["summary"],
+    )
+
 
     return JSONResponse(
         {
@@ -934,12 +958,11 @@ async def exotel_media(ws: WebSocket):
 
                                     # Forward REAL summary to MCP
                                     await forward_save_call_summary_to_mcp(
-                                        {
-                                            "call_id": call_id_param,
-                                            "phone_number": phone_param,
-                                            "summary": summary_param,
-                                        }
+                                        call_id_param,
+                                        phone_param,
+                                        summary_param,
                                     )
+
 
                                     # Let the model know tool-call succeeded
                                     await send_openai(
