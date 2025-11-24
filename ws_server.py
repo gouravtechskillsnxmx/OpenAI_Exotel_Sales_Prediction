@@ -210,6 +210,15 @@ app.add_middleware(
 # In-memory call transcripts keyed by Exotel stream_sid
 CALL_TRANSCRIPTS: Dict[str, Dict[str, Any]] = {}
 
+@app.get("/debug-sqlite-call-logs")
+async def debug_sqlite_call_logs():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, call_id, phone_number, status, summary, created_at FROM call_logs ORDER BY id DESC LIMIT 20")
+    rows = cur.fetchall()
+    conn.close()
+    return {"rows": rows}
+
 
 # ---------------------------------------------------------
 # HTML dashboard page
