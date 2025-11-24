@@ -8,8 +8,12 @@ Environment variables expected:
 
   EXOTEL_SID       gouravnxmx1
   EXOTEL_TOKEN     your token
-  EXO_SUBDOMAIN    api or api.in
-  EXO_CALLER_ID    your Exophone, e.g. 08047362093
+  EXO_SUBDOMAIN    api or api.in  (not used in new outbound helper, but kept for compatibility)
+  EXO_CALLER_ID    your Exophone, e.g. 02248904368
+
+  # For outbound flow URL (from Exotel support):
+  #   http://my.exotel.com/gouravnxmx1/exoml/start_voice/1077390
+  EXOTEL_FLOW_URL  (optional; falls back to the above if not set)
 
   OPENAI_API_KEY or OpenAI_Key or OPENAI_KEY
   OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview (recommended)
@@ -54,8 +58,14 @@ logger = logging.getLogger("ws_server")
 
 EXOTEL_SID = os.getenv("EXOTEL_SID", "")
 EXOTEL_TOKEN = os.getenv("EXOTEL_TOKEN", "")
-EXO_SUBDOMAIN = os.getenv("EXO_SUBDOMAIN", "api")  # "api" or "api.in"
+EXO_SUBDOMAIN = os.getenv("EXO_SUBDOMAIN", "api")  # kept for compatibility
 EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")
+
+# New: outbound flow URL (from Exotel support pattern)
+EXOTEL_FLOW_URL = os.getenv(
+    "EXOTEL_FLOW_URL",
+    "http://my.exotel.com/gouravnxmx1/exoml/start_voice/1077390",  # default based on support snippet
+)
 
 OPENAI_API_KEY = (
     os.getenv("OPENAI_API_KEY")
@@ -155,25 +165,187 @@ CALL_TRANSCRIPTS: Dict[str, Dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------
-# HTML test page (optional)
+# HTML dashboard page
 # ---------------------------------------------------------
 
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
   <head>
-    <title>Exotel LIC Voicebot</title>
+    <title>Exotel LIC Voicebot Dashboard</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 20px; }
+      h1, h2 { color: #333; }
+      .section {
+        border: 1px solid #ccc;
+        padding: 16px;
+        margin-bottom: 24px;
+        border-radius: 8px;
+      }
+      label { display: block; margin-bottom: 4px; }
+      input[type="text"], input[type="tel"] {
+        padding: 6px 8px;
+        width: 260px;
+        max-width: 90%%;
+        margin-bottom: 8px;
+      }
+      button {
+        padding: 8px 12px;
+        background: #007bff;
+        color: #fff;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button:disabled {
+        background: #999;
+        cursor: not-allowed;
+      }
+      #call-result {
+        margin-top: 8px;
+        font-family: monospace;
+        white-space: pre-wrap;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%%;
+        margin-top: 12px;
+      }
+      table, th, td { border: 1px solid #ccc; }
+      th, td { padding: 6px 8px; text-align: left; font-size: 0.9rem; }
+    </style>
   </head>
   <body>
     <h1>Exotel LIC Voicebot Backend</h1>
-    <p>This service powers Exotel outbound calls + Realtime OpenAI voice agent.</p>
-    <ul>
-      <li><code>GET /</code> – this page</li>
-      <li><code>GET /exotel-ws-bootstrap</code> – used by Exotel Voicebot "Dynamic WS URL"</li>
-      <li><code>GET /call_logs</code> – view recent call logs</li>
-      <li><code>POST /exotel-outbound-call</code> – trigger outbound call</li>
-      <li><code>POST /exotel-status</code> – Exotel status callback (optional)</li>
-    </ul>
+
+    <div class="section">
+      <h2>Single Outbound Call</h2>
+      <form id="single-call-form">
+        <label for="phone-input">Customer Phone (e.g. 09111717620)</label>
+        <input id="phone-input" type="tel" placeholder="Enter phone number" />
+        <br />
+        <button id="call-button" type="submit">Call Now</button>
+      </form>
+      <div id="call-result"></div>
+    </div>
+
+    <div class="section">
+      <h2>Call Logs (Last 50)</h2>
+      <button id="refresh-logs">Refresh Logs</button>
+      <table id="logs-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Call ID</th>
+            <th>Phone</th>
+            <th>Status</th>
+            <th>Summary</th>
+            <th>Created At</th>
+          </tr>
+        </thead>
+        <tbody id="logs-body">
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section">
+      <h2>MCP Test</h2>
+      <p>
+        Click the button below to call <code>/test-mcp</code>, which will:
+      </p>
+      <ul>
+        <li>Insert a dummy row into <code>call_logs</code></li>
+        <li>Forward a test payload to <code>LIC_CRM_MCP_BASE_URL/test-save</code></li>
+      </ul>
+      <button id="mcp-test-button">Run MCP Test</button>
+      <div id="mcp-result"></div>
+    </div>
+
+    <script>
+      async function triggerSingleCall(evt) {
+        evt.preventDefault();
+        const phoneInput = document.getElementById("phone-input");
+        const btn = document.getElementById("call-button");
+        const resultDiv = document.getElementById("call-result");
+        const phone = phoneInput.value.trim();
+        if (!phone) {
+          resultDiv.textContent = "Please enter a phone number.";
+          return;
+        }
+
+        btn.disabled = true;
+        resultDiv.textContent = "Placing call...";
+
+        try {
+          const resp = await fetch("/exotel-outbound-call", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ phone }),
+          });
+          const data = await resp.json();
+          resultDiv.textContent = JSON.stringify(data, null, 2);
+        } catch (e) {
+          resultDiv.textContent = "Error: " + e;
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      async function loadCallLogs() {
+        const tbody = document.getElementById("logs-body");
+        tbody.innerHTML = "";
+        try {
+          const resp = await fetch("/call_logs");
+          const data = await resp.json();
+          const logs = data.call_logs || [];
+          for (const row of logs) {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+              <td>${row.id}</td>
+              <td>${row.call_id || ""}</td>
+              <td>${row.phone_number || ""}</td>
+              <td>${row.status || ""}</td>
+              <td>${(row.summary || "").slice(0, 80)}</td>
+              <td>${row.created_at || ""}</td>
+            `;
+            tbody.appendChild(tr);
+          }
+        } catch (e) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="6">Error loading logs: ${e}</td>`;
+          tbody.appendChild(tr);
+        }
+      }
+
+      async function runMcpTest() {
+        const btn = document.getElementById("mcp-test-button");
+        const div = document.getElementById("mcp-result");
+        btn.disabled = true;
+        div.textContent = "Calling /test-mcp ...";
+        try {
+          const resp = await fetch("/test-mcp");
+          const data = await resp.json();
+          div.textContent = JSON.stringify(data, null, 2);
+          await loadCallLogs();
+        } catch (e) {
+          div.textContent = "Error: " + e;
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      document.getElementById("single-call-form")
+        .addEventListener("submit", triggerSingleCall);
+
+      document.getElementById("refresh-logs")
+        .addEventListener("click", loadCallLogs);
+
+      document.getElementById("mcp-test-button")
+        .addEventListener("click", runMcpTest);
+
+      // Initial load
+      loadCallLogs();
+    </script>
   </body>
 </html>
 """
@@ -210,7 +382,7 @@ async def exotel_ws_bootstrap():
 
 
 # ---------------------------------------------------------
-# Simple lead + call log API (optional, for dashboard)
+# Simple lead + call log API (JSON, used by dashboard)
 # ---------------------------------------------------------
 
 @app.get("/call_logs")
@@ -260,7 +432,7 @@ async def create_lead(request: Request):
     conn.commit()
     conn.close()
 
-    # Trigger Exotel call
+    # Trigger Exotel call (single lead)
     result = exotel_outbound_call(phone)
     call_sid = result.get("Call", {}).get("Sid") if isinstance(result, dict) else None
 
@@ -312,21 +484,34 @@ async def get_leads():
 
 def exotel_outbound_call(to_number: str) -> Dict[str, Any]:
     """
-    Trigger an outbound call using Exotel API.
+    Trigger an outbound call using Exotel API, using the same pattern
+    that Exotel support gave and which works via curl:
+
+      curl -X POST "https://API_KEY:API_TOKEN@api.exotel.com/v1/Accounts/gouravnxmx1/Calls/connect.json" \\
+        -d "From=09111717620" \\
+        -d "CallerId=02248904368" \\
+        -d "Url=http://my.exotel.com/gouravnxmx1/exoml/start_voice/1077390" \\
+        -H "accept: application/json"
+
+    We adapt this to use environment variables:
+      - EXOTEL_SID
+      - EXOTEL_TOKEN
+      - EXO_CALLER_ID
+      - EXOTEL_FLOW_URL
     """
     if not EXOTEL_SID or not EXOTEL_TOKEN or not EXO_CALLER_ID:
         logger.error("Exotel credentials or caller ID missing; cannot place outbound call.")
         return {"error": "exotel credentials/caller id missing"}
 
-    exotel_url = f"https://{EXO_SUBDOMAIN}.{EXOTEL_SID}:{EXOTEL_TOKEN}@{EXO_SUBDOMAIN}.exotel.com/v1/Accounts/{EXOTEL_SID}/Calls/connect"
+    exotel_url = f"https://{EXOTEL_SID}:{EXOTEL_TOKEN}@api.exotel.com/v1/Accounts/{EXOTEL_SID}/Calls/connect.json"
 
     payload = {
-        "From": to_number,
-        "To": EXO_CALLER_ID,
-        "CallerId": EXO_CALLER_ID,
-        "Url": "http://my.exotel.com/Exotel/exoml/start/1075544",
+        "From": to_number,          # customer phone (verified) – same as curl "From"
+        "CallerId": EXO_CALLER_ID,  # your Exotel number – same as curl "CallerId"
+        "Url": EXOTEL_FLOW_URL,     # flow/app URL – same as curl "Url"
     }
 
+    logger.info("Exotel outbound call URL: %s", exotel_url)
     logger.info("Exotel outbound call payload: %s", payload)
 
     try:
@@ -336,12 +521,8 @@ def exotel_outbound_call(to_number: str) -> Dict[str, Any]:
         resp.raise_for_status()
         text = resp.text
         logger.info("Exotel outbound call result: %s", text)
-        try:
-            # Exotel returns XML; parse minimally
-            # We just stash the raw result here for logging
-            return {"raw": text}
-        except Exception:
-            return {"raw": text}
+        # Exotel returns XML/JSON; we just return the raw text for now
+        return {"raw": text}
     except Exception as e:
         logger.exception("Error placing Exotel outbound call: %s", e)
         return {"error": str(e)}
@@ -351,7 +532,8 @@ def exotel_outbound_call(to_number: str) -> Dict[str, Any]:
 async def exotel_outbound_call_endpoint(request: Request):
     """
     Simple HTTP endpoint to trigger an outbound Exotel call from JSON:
-      { "phone": "8850298070" }
+      { "phone": "09111717620" }
+    Used by the 'Single Outbound Call' form on the dashboard.
     """
     data = await request.json()
     phone = data.get("phone", "").strip()
@@ -381,6 +563,54 @@ async def forward_save_call_summary_to_mcp(payload: Dict[str, Any]) -> None:
             logger.info("MCP response: status=%s body=%s", r.status_code, r.text)
     except Exception:
         logger.exception("Error forwarding save_call_summary to MCP server")
+
+
+# ---------------------------------------------------------
+# MCP test endpoint (manual verification)
+# ---------------------------------------------------------
+
+@app.get("/test-mcp")
+async def test_mcp():
+    """
+    Manual test endpoint to verify MCP + DB wiring.
+
+    - Inserts a dummy row into call_logs with status = 'test-mcp'
+    - Calls LIC_CRM_MCP_BASE_URL/test-save with a dummy payload
+    - Returns both the payload and MCP base URL in JSON
+
+    Usage:
+      - Open / in the browser and click "Run MCP Test"
+      - Or call directly: GET /test-mcp
+    """
+    dummy = {
+        "call_id": "test-call-123",
+        "phone_number": "9999999999",
+        "summary": "Test summary from /test-mcp endpoint.",
+    }
+
+    # Insert into DB
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO call_logs (call_id, phone_number, status, summary)
+        VALUES (?, ?, ?, ?)
+        """,
+        (dummy["call_id"], dummy["phone_number"], "test-mcp", dummy["summary"]),
+    )
+    conn.commit()
+    conn.close()
+
+    # Forward to MCP (if configured)
+    await forward_save_call_summary_to_mcp(dummy)
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "mcp_base_url": LIC_CRM_MCP_BASE_URL,
+            "payload_sent": dummy,
+        }
+    )
 
 
 # ---------------------------------------------------------
