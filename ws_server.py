@@ -220,6 +220,41 @@ async def debug_sqlite_call_logs():
     return {"rows": rows}
 
 
+@app.get("/debug-mcp-direct")
+async def debug_mcp_direct():
+    """
+    Sends a REAL MCP call using exact payload.
+    This proves whether ws_server.py can talk to MCP server or not.
+    """
+    if not LIC_CRM_MCP_BASE_URL:
+        return {"error": "LIC_CRM_MCP_BASE_URL is not set"}
+
+    payload = {
+        "call_id": "debug_call_001",
+        "phone_number": "+910000000000",
+        "customer_name": "DebugUser",
+        "intent": "debug_intent",
+        "interest_score": 5,
+        "next_action": "callback_debug",
+        "raw_summary": "This is a debug summary from ws_server.py directly."
+    }
+
+    url = f"{LIC_CRM_MCP_BASE_URL}/test-save"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(url, json=payload)
+            return {
+                "status": r.status_code,
+                "body": r.text,
+                "sent_to": url,
+                "payload": payload
+            }
+    except Exception as e:
+        return {"exception": str(e), "sent_to": url, "payload": payload}
+
+
+
 # ---------------------------------------------------------
 # HTML dashboard page
 # ---------------------------------------------------------
