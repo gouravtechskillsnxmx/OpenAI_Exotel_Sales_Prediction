@@ -883,7 +883,7 @@ async def exotel_media(ws: WebSocket):
 
                             await send_audio_to_exotel(pcm8)
 
-                        # TOOL CALL: use function_call_arguments.done when args are final
+                        # TOOL CALL: where call summary is GENERATED and logged
                         elif et == "response.function_call_arguments.done":
                             name = evt.get("name")
                             arg_str = evt.get("arguments") or "{}"
@@ -1038,7 +1038,14 @@ async def exotel_media(ws: WebSocket):
                 meta_call_id = meta.get("call_id") or call_id or (stream_sid or "unknown_call")
                 meta_phone = meta.get("phone_number") or caller_number or ""
 
-                # Save minimal record if we don't already have one
+                # Auto-generate a simple placeholder summary
+                summary_text = (
+                    f"Call with {meta_phone or 'unknown number'} "
+                    f"(call_id={meta_call_id}) has ended. "
+                    "Detailed model summary was not available; this is an auto-generated placeholder."
+                )
+
+                # Save minimal record with placeholder summary
                 conn = sqlite3.connect(DB_PATH)
                 cur = conn.cursor()
                 cur.execute(
@@ -1046,10 +1053,16 @@ async def exotel_media(ws: WebSocket):
                     INSERT INTO call_logs (call_id, phone_number, status, summary)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (meta_call_id, meta_phone, "stopped", ""),
+                    (meta_call_id, meta_phone, "stopped", summary_text),
                 )
                 conn.commit()
                 conn.close()
+
+                # Also log summary to MCP Postgres DB (best-effort)
+                try:
+                    await log_call_summary_to_db(meta_call_id, meta_phone, summary_text)
+                except Exception:
+                    logger.exception("Error while calling log_call_summary_to_db from stop event")
 
                 break
 
