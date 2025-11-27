@@ -979,6 +979,8 @@ async def exotel_media(ws: WebSocket):
                 continue
 
             elif ev == "start":
+				
+                logger.info("Exotel sent Start event --GV ")
                 start_obj = evt.get("start") or {}
                 stream_sid = start_obj.get("stream_sid") or evt.get("stream_sid")
                 start_ts = time.time()
@@ -1004,12 +1006,25 @@ async def exotel_media(ws: WebSocket):
                     "turns": [],  # list of (speaker, text)
                 }
 
+                try:
+                    await log_call_summary_to_db(
+                        call_id or stream_sid or "unknown_call",
+                        caller_number or "",
+                        f"Debug insert from ws_server.py start event for call_id={call_id}, phone={caller_number}",
+                    )
+                    logger.info("Debug MCP insert from start event completed")
+                except Exception:
+                    logger.exception("Debug MCP insert from start event FAILED")
+
+
                 if not openai_started:
                     openai_started = True
                     await connect_openai(call_id or "unknown_call", caller_number or "")
 
             elif ev == "media":
                 # Caller audio (8kHz PCM16) -> upsample to 24kHz -> send to OpenAI
+				
+                logger.info("Exotel sent Media event --GV ")
                 media = evt.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64 and openai_ws and not openai_ws.closed:
