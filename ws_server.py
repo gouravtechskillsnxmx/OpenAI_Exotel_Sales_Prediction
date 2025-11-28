@@ -318,7 +318,7 @@ HTML_PAGE = """
               <td>${row.call_id || ""}</td>
               <td>${row.phone_number || ""}</td>
               <td>${row.status || ""}</td>
-              <td>${(row.summary || "").slice(0, 80)}</td>
+              <td>${(row.summary || "").slice(0, 1000)}</td>
               <td>${row.created_at || ""}</td>
             `;
             tbody.appendChild(tr);
@@ -639,6 +639,72 @@ async def test_mcp():
             "payload_sent": dummy,
         }
     )
+#---------------------------------
+#------call_logs backup endpoint------
+#----------------------------------
+@app.get("/backup/call_logs")
+async def backup_call_logs():
+    """
+    Backup endpoint: returns all call_logs and call_log_labels as JSON.
+
+    Use this to take a snapshot of your data periodically.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # 1) Dump call_logs
+    cur.execute(
+        """
+        SELECT id, call_id, phone_number, status, summary, created_at
+        FROM call_logs
+        ORDER BY id ASC
+        """
+    )
+    call_logs_rows = cur.fetchall()
+
+    call_logs = [
+        {
+            "id": r[0],
+            "call_id": r[1],
+            "phone_number": r[2],
+            "status": r[3],
+            "summary": r[4],
+            "created_at": r[5],
+        }
+        for r in call_logs_rows
+    ]
+
+    # 2) Dump call_log_labels (if table exists)
+    labels = []
+    try:
+        cur.execute(
+            """
+            SELECT call_log_id, purchased
+            FROM call_log_labels
+            ORDER BY call_log_id ASC
+            """
+        )
+        label_rows = cur.fetchall()
+        labels = [
+            {
+                "call_log_id": r[0],
+                "purchased": bool(r[1]),
+            }
+            for r in label_rows
+        ]
+    except sqlite3.OperationalError:
+        # Table might not exist on older deployments; don't crash backup
+        labels = []
+
+    conn.close()
+
+    return {
+        "status": "ok",
+        "call_logs_count": len(call_logs),
+        "labels_count": len(labels),
+        "call_logs": call_logs,
+        "call_log_labels": labels,
+    }
 
 
 # ---------------------------------------------------------
