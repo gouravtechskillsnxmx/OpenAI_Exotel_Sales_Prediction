@@ -23,5 +23,6 @@ SQLAlchemy==2.0.36
 psycopg2-binary==2.9.9
 httpx>=0.27.0
 aiohttp
-sklearn
+scikit-learn>=1.5.0
+
 
