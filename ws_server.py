@@ -41,6 +41,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import Pipeline
+import joblib
+
+
 # ---------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------
@@ -639,7 +645,156 @@ async def test_mcp():
             "payload_sent": dummy,
         }
     )
+#-----------------------------------------------------
+#--------ML end points 
 #---------------------------------
+
+# ---------------------------------------------------------
+# ML: label calls (supervised training), train model, top 10
+# ---------------------------------------------------------
+
+MODEL_PATH = os.getenv("CALL_LOGS_ML_MODEL_PATH", "/data/call_logs_promising_model.joblib")
+
+def get_labeled_data():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # Ensure label table exists
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS call_log_labels (
+            call_log_id INTEGER PRIMARY KEY,
+            purchased INTEGER
+        )
+    """)
+
+    # Join call_logs + call_log_labels
+    cur.execute("""
+        SELECT l.call_log_id, c.summary, l.purchased
+        FROM call_log_labels l
+        JOIN call_logs c ON c.id = l.call_log_id
+        ORDER BY l.call_log_id ASC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    texts = []
+    labels = []
+
+    for row in rows:
+        cid, summary, purchased = row
+        if summary and summary.strip():
+            texts.append(summary)
+            labels.append(int(purchased))
+
+    return texts, labels
+
+
+@app.post("/label-call-log")
+async def label_call_log(request: Request):
+    """
+    Label a call log as purchased=true/false.
+    Body: { "call_log_id": 12, "purchased": true }
+    """
+    data = await request.json()
+    call_log_id = data.get("call_log_id")
+    purchased = bool(data.get("purchased", False))
+
+    if not call_log_id:
+        return {"status": "error", "message": "call_log_id required"}
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS call_log_labels (
+            call_log_id INTEGER PRIMARY KEY,
+            purchased INTEGER
+        )
+    """)
+
+    cur.execute("""
+        INSERT OR REPLACE INTO call_log_labels (call_log_id, purchased)
+        VALUES (?, ?)
+    """, (call_log_id, int(purchased)))
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "ok", "call_log_id": call_log_id, "purchased": purchased}
+
+
+@app.post("/train-ml-call-logs")
+async def train_ml_call_logs():
+    """
+    Train logistic regression based on labeled call logs.
+    Saves model to /data disk.
+    """
+    texts, labels = get_labeled_data()
+
+    if len(texts) < 4:
+        return {
+            "status": "error",
+            "message": f"Need at least 4 labeled rows. Currently have {len(texts)}."
+        }
+
+    clf = Pipeline([
+        ("tfidf", TfidfVectorizer()),
+        ("lr", LogisticRegression(max_iter=200))
+    ])
+
+    clf.fit(texts, labels)
+    joblib.dump(clf, MODEL_PATH)
+
+    return {
+        "status": "ok",
+        "message": f"Model trained and saved to {MODEL_PATH}",
+        "samples": len(texts)
+    }
+
+
+@app.get("/top10-ml-call-logs")
+async def top10_ml_call_logs(limit: int = 10):
+    """
+    Returns top N promising leads with ML score.
+    """
+    if not os.path.exists(MODEL_PATH):
+        return {
+            "status": "error",
+            "message": f"Model file not found at {MODEL_PATH}. Train first."
+        }
+
+    clf = joblib.load(MODEL_PATH)
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, call_id, phone_number, summary, created_at
+        FROM call_logs
+        ORDER BY id DESC
+        LIMIT 200
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    results = []
+    for r in rows:
+        cid, call_id, phone, summary, created_at = r
+        if not summary:
+            continue
+        score = clf.predict_proba([summary])[0][1]  # probability of purchase
+        results.append({
+            "call_log_id": cid,
+            "call_id": call_id,
+            "phone": phone,
+            "summary": summary,
+            "ml_score": float(score),
+            "created_at": created_at
+        })
+
+    results = sorted(results, key=lambda x: x["ml_score"], reverse=True)
+    return {"status": "ok", "top": results[:limit]}
+
 #------call_logs backup endpoint------
 #----------------------------------
 @app.get("/backup/call_logs")
