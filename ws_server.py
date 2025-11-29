@@ -939,6 +939,8 @@ async def exotel_media(ws: WebSocket):
     call_id: Optional[str] = None
     caller_number: Optional[str] = None
     stream_sid: Optional[str] = None
+    call_start_ts: Optional[float] = None
+    had_audio: bool = False
 
     if not OPENAI_API_KEY:
         logger.error("No OPENAI_API_KEY; closing Exotel stream.")
@@ -1181,10 +1183,34 @@ async def exotel_media(ws: WebSocket):
                             if name == "save_call_summary":
                                 call_id_param = args.get("call_id") or conn_call_id
                                 phone_param = args.get("phone_number") or conn_caller_number
-                                summary_param = args.get("summary") or ""
+                                summary_param = (args.get("summary") or "").strip()
+
+                                # Append total call duration if we know it
+                                duration_seconds = None
+                                if call_start_ts:
+                                    try:
+                                        duration_seconds = int(time.time() - call_start_ts)
+                                    except Exception:
+                                        duration_seconds = None
+
+                                if duration_seconds is not None:
+                                    m, s = divmod(duration_seconds, 60)
+                                    duration_text = f"{m}m {s}s" if m > 0 else f"{s}s"
+                                    # Avoid double-appending if model already mentioned it
+                                    if "Total call duration:" not in summary_param:
+                                        if summary_param:
+                                            summary_param = (
+                                                summary_param
+                                                + f"\n\nTotal call duration: {duration_text}."
+                                            )
+                                        else:
+                                            summary_param = (
+                                                f"Caller did not speak anything during the call.\n\n"
+                                                f"Total call duration: {duration_text}."
+                                            )
 
                                 logger.info(
-                                    "REAL SUMMARY RECEIVED FROM MODEL: %s",
+                                    "REAL SUMMARY RECEIVED FROM MODEL (with duration): %s",
                                     summary_param,
                                 )
 
@@ -1205,6 +1231,28 @@ async def exotel_media(ws: WebSocket):
                                 )
                                 conn.commit()
                                 conn.close()
+
+                                # Forward REAL summary to MCP Postgres DB
+                                await log_call_summary_to_db(
+                                    call_id_param,
+                                    phone_param,
+                                    summary_param,
+                                )
+
+                                # Let the model know tool-call succeeded
+                                await send_openai(
+                                    {
+                                        "type": "response.create",
+                                        "response": {
+                                            "instructions": (
+                                                "I have saved the call summary to the CRM. "
+                                                "Thank the customer politely and end the call."
+                                            ),
+                                            "modalities": ["text", "audio"],
+                                        },
+                                    }
+                                )
+
 
                                 # Forward REAL summary to MCP Postgres DB
                                 await log_call_summary_to_db(
@@ -1264,6 +1312,7 @@ async def exotel_media(ws: WebSocket):
                 start_obj = evt.get("start") or {}
                 stream_sid = start_obj.get("stream_sid") or evt.get("stream_sid")
                 start_ts = time.time()
+                call_start_ts = time.time()
 
                 call_id = start_obj.get("call_sid") or start_obj.get("callSid") or evt.get("call_sid")
                 caller_number = (
@@ -1313,6 +1362,8 @@ async def exotel_media(ws: WebSocket):
                     except Exception:
                         logger.warning("Invalid base64 in Exotel media payload")
                         continue
+                    
+                    had_audio = True
 
                     pcm24 = upsample_8k_to_24k_pcm16(pcm8)
                     audio_b64 = base64.b64encode(pcm24).decode("ascii")
@@ -1333,14 +1384,38 @@ async def exotel_media(ws: WebSocket):
                 meta_call_id = meta.get("call_id") or call_id or (stream_sid or "unknown_call")
                 meta_phone = meta.get("phone_number") or caller_number or ""
 
-                # Auto-generate a simple placeholder summary
-                summary_text = (
-                    f"Call with {meta_phone or 'unknown number'} "
-                    f"(call_id={meta_call_id}) has ended. "
-                    "Detailed model summary was not available; this is an auto-generated placeholder."
-                )
+                # Compute a simple total call duration
+                duration_seconds = None
+                if call_start_ts:
+                    try:
+                        duration_seconds = int(time.time() - call_start_ts)
+                    except Exception:
+                        duration_seconds = None
 
-                # Save minimal record with placeholder summary
+                def pretty_duration(sec: Optional[int]) -> str:
+                    if sec is None:
+                        return "unknown"
+                    m, s = divmod(sec, 60)
+                    if m > 0:
+                        return f"{m}m {s}s"
+                    return f"{s}s"
+
+                # If we never saw any media frames, the caller literally never spoke
+                if not had_audio:
+                    summary_text = (
+                        f"Call to {meta_phone or 'unknown number'} (call_id={meta_call_id}) "
+                        f"ended without the caller speaking anything. "
+                        f"Total call duration: {pretty_duration(duration_seconds)}."
+                    )
+                else:
+                    # We had some audio, but no detailed summary from the model
+                    summary_text = (
+                        f"Call with {meta_phone or 'unknown number'} (call_id={meta_call_id}) "
+                        f"ended before a detailed AI summary could be saved. "
+                        f"Total call duration: {pretty_duration(duration_seconds)}."
+                    )
+
+                # Save minimal record with improved summary (status remains 'stopped')
                 conn = sqlite3.connect(DB_PATH)
                 cur = conn.cursor()
                 cur.execute(
