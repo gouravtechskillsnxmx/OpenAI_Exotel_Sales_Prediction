@@ -169,6 +169,65 @@ app.add_middleware(
 # In-memory call transcripts keyed by Exotel stream_sid
 CALL_TRANSCRIPTS: Dict[str, Dict[str, Any]] = {}
 
+@app.post("/import_call_logs")
+async def import_call_logs(request: Request):
+    """
+    Bulk-import call logs from JSON.
+    Expected body:
+    {
+      "rows": [
+        {
+          "call_id": "aa05d63a8179...",
+          "phone": "08850298070",
+          "status": "completed",
+          "summary": "Call with 08850298070 (call_id=...).",
+          "created_at": "2025-11-27 18:27:39"
+        },
+        ...
+      ]
+    }
+    """
+    body = await request.json()
+    rows = body.get("rows", [])
+    if not isinstance(rows, list):
+        return {"status": "error", "message": "rows must be a list"}
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    inserted = 0
+    for r in rows:
+        call_id = r.get("call_id") or ""
+        phone = r.get("phone") or r.get("phone_number") or ""
+        status = r.get("status") or ""
+        summary = r.get("summary") or ""
+        created_at = r.get("created_at")  # string, we'll trust the value
+
+        # Clean up old placeholders while importing
+        placeholder = "Detailed model summary was not available; this is an auto-generated placeholder."
+        if placeholder in summary:
+            summary = summary.replace(placeholder, "").strip()
+
+        if "customer_phone_number" in summary:
+            summary = summary.replace("customer_phone_number", "mobile number")
+
+        if "example_call_id_12345" in summary and call_id:
+            summary = summary.replace("example_call_id_12345", str(call_id))
+
+        cur.execute(
+            """
+            INSERT INTO call_logs (call_id, phone_number, status, summary, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (call_id, phone, status, summary, created_at),
+        )
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "ok", "inserted": inserted}
+
 
 @app.get("/debug-sqlite-call-logs")
 async def debug_sqlite_call_logs():
