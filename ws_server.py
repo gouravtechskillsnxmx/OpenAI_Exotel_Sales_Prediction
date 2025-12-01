@@ -941,6 +941,10 @@ async def exotel_media(ws: WebSocket):
     stream_sid: Optional[str] = None
     call_start_ts: Optional[float] = None
     had_audio: bool = False
+    # NEW: transcript capture buffers (Option B)
+    ai_transcript_texts: list[str] = []
+    summary_saved: bool = False  # tracks if model already saved summary
+
 
     if not OPENAI_API_KEY:
         logger.error("No OPENAI_API_KEY; closing Exotel stream.")
@@ -1138,6 +1142,11 @@ async def exotel_media(ws: WebSocket):
                         et = evt.get("type")
                         logger.debug("OpenAI EVENT: %s - %s", et, evt)
 
+                        if et == "response.output_text.delta":
+                            text_chunk = evt.get("text") or ""
+                            if text_chunk:
+                                ai_transcript_texts.append(text_chunk)
+
                         # Audio deltas from model
                         if et in ("response.audio.delta", "response.output_audio.delta"):
                             delta = evt.get("delta") or evt.get("audio") or {}
@@ -1184,6 +1193,8 @@ async def exotel_media(ws: WebSocket):
                                 call_id_param = args.get("call_id") or conn_call_id
                                 phone_param = args.get("phone_number") or conn_caller_number
                                 summary_param = (args.get("summary") or "").strip()
+                                summary_saved = True
+
 
                                 # Append total call duration if we know it
                                 duration_seconds = None
@@ -1359,6 +1370,7 @@ async def exotel_media(ws: WebSocket):
                 if payload_b64 and openai_ws and not openai_ws.closed:
                     try:
                         pcm8 = base64.b64decode(payload_b64)
+                        had_audio = True   # NEW
                     except Exception:
                         logger.warning("Invalid base64 in Exotel media payload")
                         continue
@@ -1378,6 +1390,60 @@ async def exotel_media(ws: WebSocket):
 
             elif ev == "stop":
                 logger.info("Exotel sent stop; closing WS and letting model wrap up.")
+
+                #--------------------------------------added for improved summary on stop
+                # --- NEW: Duration and fallback summary logic (Option B) ---
+                # Compute duration
+                duration_seconds = None
+                if call_start_ts:
+                    try:
+                        duration_seconds = int(time.time() - call_start_ts)
+                    except:
+                        duration_seconds = None
+
+                # Inline duration formatting (no helper function)
+                if duration_seconds is None:
+                    dur_text = "unknown"
+                else:
+                    m, s = divmod(duration_seconds, 60)
+                    dur_text = f"{m}m {s}s" if m else f"{s}s"
+
+                # NEW: If summary was never saved by AI, build fallback summary
+                fallback_summary_text = None
+
+                # If AI spoke, we have transcript text
+                if not summary_saved and ai_transcript_texts:
+                    raw_text = " ".join(ai_transcript_texts)
+                    try:
+                        completion = client.responses.create(
+                            model=OPENAI_MODEL,
+                            input=(
+                                "Summarise this phone conversation in 5–6 sentences. "
+                                "You are an LIC senior advisor. "
+                                "Conversation text:\n\n" + raw_text
+                            )
+                        )
+                        fallback_summary_text = completion.output_text.strip()
+                        fallback_summary_text += f"\n\nTotal call duration: {dur_text}."
+                    except Exception:
+                        logger.exception("GPT fallback summary failed")
+
+                # If caller was silent
+                if not summary_saved and not fallback_summary_text and not had_audio:
+                    fallback_summary_text = (
+                        f"Caller did not speak anything during the call. "
+                        f"Total call duration: {dur_text}."
+                    )
+
+                # If caller spoke but AI gave no final summary
+                if not summary_saved and not fallback_summary_text and had_audio:
+                    fallback_summary_text = (
+                        f"AI agent spoke but no final summary was produced. "
+                        f"Total call duration: {dur_text}."
+                    )
+                # --- END NEW BLOCK ---
+
+                #-----------------------------------
 
                 # Fetch metadata for minimal record
                 meta = CALL_TRANSCRIPTS.get(stream_sid) or {}
@@ -1416,6 +1482,10 @@ async def exotel_media(ws: WebSocket):
                     )
 
                 # Save minimal record with improved summary (status remains 'stopped')
+                # If a fallback summary was generated, override summary_text before inserting
+                if not summary_saved and fallback_summary_text:
+                    summary_text = fallback_summary_text
+
                 conn = sqlite3.connect(DB_PATH)
                 cur = conn.cursor()
                 cur.execute(
