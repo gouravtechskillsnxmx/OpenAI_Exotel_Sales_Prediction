@@ -1435,12 +1435,30 @@ async def exotel_media(ws: WebSocket):
                         f"Total call duration: {dur_text}."
                     )
 
-                # If caller spoke but AI gave no final summary
-                if not summary_saved and not fallback_summary_text and had_audio:
+                # If caller was silent
+                if not summary_saved and not fallback_summary_text and not had_audio:
                     fallback_summary_text = (
-                        f"AI agent spoke but no final summary was produced. "
+                        f"Caller did not speak anything during the call. "
                         f"Total call duration: {dur_text}."
+                )
+
+                # If we still have no summary and there *was* some audio, decide based on duration
+                if not summary_saved and not fallback_summary_text and had_audio:
+                    # Very short call (e.g. 1–3 seconds) – treat as quick disconnect
+                    if  duration_seconds is not None and duration_seconds <= 3:
+                            fallback_summary_text = (
+                            f"Caller disconnected almost immediately after the call started; "
+                            f"no meaningful conversation took place. "
+                            f"Total call duration: {dur_text}."
                     )
+                    else:
+                        # Longer call where AI spoke but didn't return a summary
+                        fallback_summary_text = (
+                            "Due to a technical issue, the AI could not generate a summary for this call. "
+                            "Please review this call manually in the call_logs dashboard. "
+                            f"Total call duration: {dur_text}."
+                        )
+
                 # --- END NEW BLOCK ---
 
                 #-----------------------------------
