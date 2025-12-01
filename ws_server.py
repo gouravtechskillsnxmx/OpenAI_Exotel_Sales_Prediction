@@ -1428,13 +1428,7 @@ async def exotel_media(ws: WebSocket):
                     except Exception:
                         logger.exception("GPT fallback summary failed")
 
-                # If caller was silent
-                if not summary_saved and not fallback_summary_text and not had_audio:
-                    fallback_summary_text = (
-                        f"Caller did not speak anything during the call. "
-                        f"Total call duration: {dur_text}."
-                    )
-
+                
                 # If caller was silent
                 if not summary_saved and not fallback_summary_text and not had_audio:
                     fallback_summary_text = (
@@ -1454,9 +1448,10 @@ async def exotel_media(ws: WebSocket):
                     else:
                         # Longer call where AI spoke but didn't return a summary
                         fallback_summary_text = (
-                            "Due to a technical issue, the AI could not generate a summary for this call. "
-                            "Please review this call manually in the call_logs dashboard. "
-                            f"Total call duration: {dur_text}."
+                        "Caller did not respond or speak meaningfully during the call. "
+                        "The AI agent attempted to speak and prompt the caller, "
+                        "but no real conversation took place."
+                         f"Total call duration: {dur_text}."
                         )
 
                 # --- END NEW BLOCK ---
