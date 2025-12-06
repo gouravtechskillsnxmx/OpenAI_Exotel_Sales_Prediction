@@ -457,10 +457,10 @@ HTML_PAGE = """
       
       document.getElementById("download-ranked")
         .addEventListener("click", downloadRankedCsv);
-
+    /*
       document.getElementById("mcp-test-button")
         .addEventListener("click", runMcpTest);
-
+        */
       // Initial load
       loadCallLogs();
     </script>
