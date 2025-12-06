@@ -46,6 +46,15 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.pipeline import Pipeline
 import joblib
+import sqlite3
+import re
+import io
+
+import numpy as np
+import pandas as pd
+from fastapi import Query
+from fastapi.responses import StreamingResponse
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 # ---------------------------------------------------------
@@ -868,6 +877,29 @@ async def top10_ml_call_logs(limit: int = 10):
     results = sorted(results, key=lambda x: x["ml_score"], reverse=True)
     return {"status": "ok", "top": results[:limit]}
 
+@app.get("/ml/ranked-customers.csv")
+async def download_ranked_customers_csv(top_k: int = Query(50, ge=1, le=500)):
+    """
+    Generate ML-based ranking of customers and return as CSV download.
+    """
+    df = _load_call_logs_df()
+    if df.empty:
+        # empty CSV
+        csv_bytes = b""
+    else:
+        df_scored = _build_interest_scores(df)
+        top_customers = _rank_customers(df_scored, top_k)
+        csv_bytes = top_customers.to_csv(index=False).encode("utf-8")
+
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="ranked_customers.csv"'
+        },
+    )
+
+
 #------call_logs backup endpoint------
 #----------------------------------
 @app.get("/backup/call_logs")
@@ -1575,3 +1607,95 @@ if __name__ == "__main__":
         reload=False,
         workers=1,
     )
+#----------------------------------------------------
+#------add helper  functions for downloading  ranked_customers csv  file  from  call logs db  -----
+#-----------------------------------------------------
+
+DB_PATH = "/data/call_logs.db"  # adjust only if you use a different path
+
+
+def _extract_duration_seconds(summary: str) -> int:
+    if not isinstance(summary, str):
+        return 0
+
+    m = re.search(r"Total call duration:\s*(\d+)m\s*(\d+)s", summary)
+    if m:
+        minutes = int(m.group(1))
+        seconds = int(m.group(2))
+        return minutes * 60 + seconds
+
+    m2 = re.search(r"Total call duration:\s*(\d+)s", summary)
+    if m2:
+        return int(m2.group(1))
+
+    return 0
+
+
+def _load_call_logs_df() -> pd.DataFrame:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            "SELECT id, call_id, phone_number, status, summary, created_at FROM call_logs",
+            conn,
+        )
+    finally:
+        conn.close()
+    return df
+
+
+def _build_interest_scores(df: pd.DataFrame) -> pd.DataFrame:
+    df["summary"] = df["summary"].fillna("")
+
+    # duration
+    df["duration_sec"] = df["summary"].apply(_extract_duration_seconds)
+
+    # TF-IDF
+    vectorizer = TfidfVectorizer(
+        max_features=2000,
+        ngram_range=(1, 2),
+        stop_words="english",
+    )
+    X = vectorizer.fit_transform(df["summary"])
+    text_interest = np.linalg.norm(X.toarray(), axis=1)
+
+    ti_arr = np.array(text_interest, dtype=float)
+    max_ti = float(ti_arr.max()) if len(ti_arr) > 0 else 0.0
+    ti_norm = ti_arr / max_ti if max_ti > 0 else np.zeros_like(ti_arr)
+
+    dur_arr = df["duration_sec"].values.astype(float)
+    max_dur = float(dur_arr.max()) if len(dur_arr) > 0 else 0.0
+    dur_norm = dur_arr / max_dur if max_dur > 0 else np.zeros_like(dur_arr)
+
+    # keyword score
+    positive_keywords = [
+        "policy", "policies", "premium", "premiums", "coverage",
+        "retirement", "investment", "invest", "term plan", "pension",
+        "ulip", "bonus", "sum assured",
+        "policy lene", "policy kharidna", "policy kharid", "interest dikhaya",
+        "रुचि", "निवेश",
+    ]
+
+    def keyword_score(text: str) -> int:
+        t = text.lower()
+        return sum(1 for kw in positive_keywords if kw in t)
+
+    kw_scores = np.array([keyword_score(s) for s in df["summary"]], dtype=float)
+    max_kw = float(kw_scores.max()) if len(kw_scores) > 0 else 0.0
+    kw_norm = kw_scores / max_kw if max_kw > 0 else np.zeros_like(kw_scores)
+
+    interest_score = 0.5 * ti_norm + 0.3 * dur_norm + 0.2 * kw_norm
+
+    df["text_interest"] = ti_norm
+    df["duration_norm"] = dur_norm
+    df["keyword_norm"] = kw_norm
+    df["interest_score"] = interest_score
+
+    return df
+
+
+def _rank_customers(df: pd.DataFrame, top_k: int) -> pd.DataFrame:
+    df_sorted = df.sort_values("interest_score", ascending=False)
+    grouped = df_sorted.groupby("phone_number")
+    best_rows = grouped.head(1).reset_index(drop=True)
+    best_rows = best_rows.sort_values("interest_score", ascending=False)
+    return best_rows.head(top_k).copy()
