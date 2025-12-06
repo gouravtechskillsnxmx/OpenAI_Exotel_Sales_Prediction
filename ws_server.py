@@ -331,9 +331,10 @@ HTML_PAGE = """
     </div>
 
     <div class="section">
-      <h2>Call Logs (Last 50)</h2>
-      <button id="refresh-logs">Refresh Logs</button>
-      <table id="logs-table">
+        <h2>Call Logs (Last 50)</h2>
+        <button id="refresh-logs">Refresh Logs</button>
+        <button id="download-ranked">Download Ranked Leads CSV</button>
+        <table id="logs-table">
         <thead>
           <tr>
             <th>ID</th>
@@ -434,12 +435,28 @@ HTML_PAGE = """
           btn.disabled = false;
         }
       }
+      async function downloadRankedCsv() {
+        const btn = document.getElementById("download-ranked");
+        btn.disabled = true;
+        try {
+          // This hits your ML endpoint and the browser will download ranked_customers.csv
+          const url = "/ml/ranked-customers.csv?top_k=50";
+          window.open(url, "_blank");
+        } catch (e) {
+          alert("Error starting download: " + e);
+        } finally {
+          btn.disabled = false;
+        }
+      }
 
       document.getElementById("single-call-form")
         .addEventListener("submit", triggerSingleCall);
 
       document.getElementById("refresh-logs")
         .addEventListener("click", loadCallLogs);
+      
+      document.getElementById("download-ranked")
+        .addEventListener("click", downloadRankedCsv);
 
       document.getElementById("mcp-test-button")
         .addEventListener("click", runMcpTest);
