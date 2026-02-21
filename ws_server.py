@@ -72,16 +72,25 @@ logger = logging.getLogger("ws_server")
 # Environment
 # ---------------------------------------------------------
 
-EXOTEL_SID = os.getenv("EXOTEL_SID", "")
-EXOTEL_TOKEN = os.getenv("EXOTEL_TOKEN", "")
-EXO_SUBDOMAIN = os.getenv("EXO_SUBDOMAIN", "api")  # kept for compatibility
+# Preferred Exotel env var names (DO NOT CHANGE)
+EXO_SID = os.getenv("EXO_SID", "")
+EXO_API_TOKEN = os.getenv("EXO_API_TOKEN", "")
+EXO_FLOW_ID = os.getenv("EXO_FLOW_ID", "")
 EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")
 
-# New: outbound flow URL (from Exotel support pattern)
-EXOTEL_FLOW_URL = os.getenv(
-    "EXOTEL_FLOW_URL",
-    "http://my.exotel.com/gouravnxmx1/exoml/start_voice/1077390",  # default based on support snippet
-)
+# Exotel outbound flow URL. If not explicitly set, build from EXO_SID + EXO_FLOW_ID when possible.
+EXOTEL_FLOW_URL = os.getenv("EXOTEL_FLOW_URL", "").strip()
+if not EXOTEL_FLOW_URL:
+    if EXO_SID and EXO_FLOW_ID:
+        EXOTEL_FLOW_URL = f"http://my.exotel.com/{EXO_SID}/exoml/start_voice/{EXO_FLOW_ID}"
+    else:
+        EXOTEL_FLOW_URL = "http://my.exotel.com/gouravnxmx1/exoml/start_voice/1077390"
+
+# Backward-compatible aliases used elsewhere in code (keep variable names; map to EXO_*).
+EXOTEL_SID = EXO_SID
+EXOTEL_TOKEN = EXO_API_TOKEN
+
+EXO_SUBDOMAIN = os.getenv("EXO_SUBDOMAIN", "api")  # kept for compatibility
 
 OPENAI_API_KEY = (
     os.getenv("OPENAI_API_KEY")
@@ -618,8 +627,8 @@ def exotel_outbound_call(to_number: str) -> Dict[str, Any]:
       - EXOTEL_FLOW_URL
     """
     if not EXOTEL_SID or not EXOTEL_TOKEN or not EXO_CALLER_ID:
-        logger.error("Exotel credentials or caller ID missing; cannot place outbound call.")
-        return {"error": "exotel credentials/caller id missing"}
+        logger.error("Exotel env missing (EXO_SID / EXO_API_TOKEN / EXO_CALLER_ID); cannot place outbound call.")
+        return {"error": "exotel env missing"}
 
     exotel_url = f"https://{EXOTEL_SID}:{EXOTEL_TOKEN}@api.exotel.com/v1/Accounts/{EXOTEL_SID}/Calls/connect.json"
 
@@ -1725,27 +1734,38 @@ def _rank_customers(df: pd.DataFrame, top_k: int) -> pd.DataFrame:
 @app.post("/bulk-call-excel")
 async def bulk_call_excel(request: Request):
     """
-    Upload an Excel (.xlsx/.xls) file containing phone numbers and trigger an Exotel call for each.
+    Bulk call from uploaded Excel (.xlsx/.xls).
 
-    - Reads the first column that looks like phone/number, else uses the first column.
-    - Triggers calls sequentially (simple + safe).
-    - Inserts a "bulk_triggered" record into call_logs for each number (so you have audit trail).
-    - The REAL call duration + REAL AI summary will still be captured by your existing
-      /exotel-media flow when the call actually happens.
-
-    Expected: multipart/form-data with field name `file`.
+    SAFETY / NO-CORRUPTION GUARDBAND:
+    - If Exotel creds are missing (EXO_SID / EXO_API_TOKEN / EXO_CALLER_ID), we return 400 and DO NOT write to DB.
+    - By default we DO NOT insert any "bulk_triggered" rows into call_logs.
+      Set env BULK_CALL_WRITE_AUDIT=1 if you explicitly want audit rows.
+    - We treat any {"error": "..."} returned by exotel_outbound_call as a failed call trigger.
+      (So you don't get fake called_ok counts.)
     """
     # Parse multipart form and extract `file`
     try:
         form = await request.form()
     except Exception as e:
         return JSONResponse({"error": f"Failed reading form-data: {e}"}, status_code=400)
+
     file = form.get("file")
+
+    # Validate Exotel env (ONLY these names matter)
+    if not EXO_SID or not EXO_API_TOKEN or not EXO_CALLER_ID:
+        return JSONResponse(
+            {
+                "error": "Exotel env missing. Required: EXO_SID, EXO_API_TOKEN, EXO_CALLER_ID (and optionally EXO_FLOW_ID / EXOTEL_FLOW_URL)."
+            },
+            status_code=400,
+        )
+
     # Local imports to avoid touching existing global imports
     import pandas as _pd
     import io as _io
     import asyncio as _asyncio
     import re as _re
+    import uuid as _uuid
 
     filename = (getattr(file, "filename", "") or "").lower()
     if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
@@ -1784,8 +1804,7 @@ async def bulk_call_excel(request: Request):
             return ""
         # keep + and digits; drop everything else
         s = _re.sub(r"[^\d+]", "", s)
-        # If it's like 9.820968e+09 from Excel float, fix by removing non-digits already helps,
-        # but scientific notation would get wrecked; handle common float case:
+        # Excel floats / scientific notation edge case
         if "e" in s.lower():
             try:
                 s2 = str(int(float(str(x))))
@@ -1793,7 +1812,16 @@ async def bulk_call_excel(request: Request):
                 s = s2
             except Exception:
                 pass
-        return s
+        # normalize +91XXXXXXXXXX or 91XXXXXXXXXX or XXXXXXXXXX to 91XXXXXXXXXX
+        digits = _re.sub(r"\D", "", s)
+        if len(digits) == 10:
+            digits = "91" + digits
+        elif len(digits) == 12 and digits.startswith("91"):
+            pass
+        else:
+            # leave as-is; exotel may accept other formats; your validation can be stricter later
+            return digits
+        return digits
 
     numbers = []
     for rn in raw_numbers:
@@ -1804,49 +1832,95 @@ async def bulk_call_excel(request: Request):
     if not numbers:
         return JSONResponse({"error": f"No phone numbers found in column '{phone_col}'."}, status_code=400)
 
-    # Rate limit between calls (seconds) — safe default
+    # De-dup while preserving order
+    seen = set()
+    deduped = []
+    for n in numbers:
+        if n not in seen:
+            seen.add(n)
+            deduped.append(n)
+    numbers = deduped
+
     delay_sec = float(os.getenv("BULK_CALL_DELAY_SEC", "2.0"))
+    write_audit = os.getenv("BULK_CALL_WRITE_AUDIT", "0").strip() == "1"
+    batch_id = str(_uuid.uuid4())
 
     results = []
-    ok = 0
-    failed = 0
+    called_ok = 0
+    called_failed = 0
 
     for n in numbers:
-        # Insert an audit trail row first
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO call_logs (call_id, phone_number, status, summary)
-                VALUES (?, ?, ?, ?)
-                """,
-                ("", n, "bulk_triggered", "Bulk call triggered from /bulk-call-excel."),
-            )
-            conn.commit()
-            conn.close()
-        except Exception:
-            logger.exception("Failed inserting bulk_triggered log row for %s", n)
-
         # Trigger Exotel call (run sync requests.post in a thread to avoid blocking the event loop)
         try:
             r = await _asyncio.to_thread(exotel_outbound_call, n)
-            results.append({"phone": n, "status": "ok", "result": r})
-            ok += 1
+            # Treat {"error": "..."} as failure
+            if isinstance(r, dict) and r.get("error"):
+                called_failed += 1
+                results.append({"phone": n, "status": "error", "error": r.get("error"), "batch_id": batch_id})
+                if write_audit:
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        cur = conn.cursor()
+                        cur.execute(
+                            """
+                            INSERT INTO call_logs (call_id, phone_number, status, summary)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            ("", n, "bulk_failed", f"bulk_batch_id={batch_id}; error={r.get('error')}"),
+                        )
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        logger.exception("Failed inserting bulk_failed audit row for %s", n)
+            else:
+                called_ok += 1
+                results.append({"phone": n, "status": "ok", "result": r, "batch_id": batch_id})
+                if write_audit:
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        cur = conn.cursor()
+                        cur.execute(
+                            """
+                            INSERT INTO call_logs (call_id, phone_number, status, summary)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            ("", n, "bulk_triggered", f"bulk_batch_id={batch_id}; bulk call triggered."),
+                        )
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        logger.exception("Failed inserting bulk_triggered audit row for %s", n)
         except Exception as e:
             logger.exception("Bulk call failed for %s", n)
-            results.append({"phone": n, "status": "error", "error": str(e)})
-            failed += 1
+            called_failed += 1
+            results.append({"phone": n, "status": "error", "error": str(e), "batch_id": batch_id})
+            if write_audit:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        INSERT INTO call_logs (call_id, phone_number, status, summary)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        ("", n, "bulk_failed", f"bulk_batch_id={batch_id}; exception={str(e)}"),
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    logger.exception("Failed inserting bulk_failed audit row for %s", n)
 
         if delay_sec > 0:
             await _asyncio.sleep(delay_sec)
 
     return {
         "status": "ok",
+        "bulk_batch_id": batch_id,
         "phone_column_used": phone_col,
         "total_numbers": len(numbers),
-        "called_ok": ok,
-        "called_failed": failed,
+        "called_ok": called_ok,
+        "called_failed": called_failed,
         "delay_sec": delay_sec,
+        "write_audit": write_audit,
         "results": results,
     }
