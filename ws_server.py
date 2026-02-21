@@ -1716,3 +1716,137 @@ def _rank_customers(df: pd.DataFrame, top_k: int) -> pd.DataFrame:
     best_rows = grouped.head(1).reset_index(drop=True)
     best_rows = best_rows.sort_values("interest_score", ascending=False)
     return best_rows.head(top_k).copy()
+
+
+# ---------------------------------------------------------
+# NEW: Bulk calling from uploaded Excel
+# ---------------------------------------------------------
+
+@app.post("/bulk-call-excel")
+async def bulk_call_excel(request: Request):
+    """
+    Upload an Excel (.xlsx/.xls) file containing phone numbers and trigger an Exotel call for each.
+
+    - Reads the first column that looks like phone/number, else uses the first column.
+    - Triggers calls sequentially (simple + safe).
+    - Inserts a "bulk_triggered" record into call_logs for each number (so you have audit trail).
+    - The REAL call duration + REAL AI summary will still be captured by your existing
+      /exotel-media flow when the call actually happens.
+
+    Expected: multipart/form-data with field name `file`.
+    """
+    # Parse multipart form and extract `file`
+    try:
+        form = await request.form()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed reading form-data: {e}"}, status_code=400)
+    file = form.get("file")
+    # Local imports to avoid touching existing global imports
+    import pandas as _pd
+    import io as _io
+    import asyncio as _asyncio
+    import re as _re
+
+    filename = (getattr(file, "filename", "") or "").lower()
+    if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
+        return JSONResponse({"error": "Please upload an Excel file (.xlsx or .xls)."}, status_code=400)
+
+    content = await file.read()
+    if not content:
+        return JSONResponse({"error": "Uploaded file is empty."}, status_code=400)
+
+    try:
+        df = _pd.read_excel(_io.BytesIO(content))
+    except Exception as e:
+        logger.exception("Failed reading Excel")
+        return JSONResponse({"error": f"Failed to read Excel: {e}"}, status_code=400)
+
+    if df.empty:
+        return JSONResponse({"error": "Excel has no rows."}, status_code=400)
+
+    # Pick phone/number column
+    cols = [str(c) for c in df.columns]
+    phone_col = None
+    for c in cols:
+        cl = c.strip().lower()
+        if any(k in cl for k in ["phone", "mobile", "number", "contact"]):
+            phone_col = c
+            break
+    if phone_col is None:
+        phone_col = cols[0]
+
+    raw_numbers = df[phone_col].tolist()
+
+    def _clean_number(x: object) -> str:
+        s = "" if x is None else str(x)
+        s = s.strip()
+        if not s:
+            return ""
+        # keep + and digits; drop everything else
+        s = _re.sub(r"[^\d+]", "", s)
+        # If it's like 9.820968e+09 from Excel float, fix by removing non-digits already helps,
+        # but scientific notation would get wrecked; handle common float case:
+        if "e" in s.lower():
+            try:
+                s2 = str(int(float(str(x))))
+                s2 = _re.sub(r"[^\d+]", "", s2)
+                s = s2
+            except Exception:
+                pass
+        return s
+
+    numbers = []
+    for rn in raw_numbers:
+        n = _clean_number(rn)
+        if n:
+            numbers.append(n)
+
+    if not numbers:
+        return JSONResponse({"error": f"No phone numbers found in column '{phone_col}'."}, status_code=400)
+
+    # Rate limit between calls (seconds) — safe default
+    delay_sec = float(os.getenv("BULK_CALL_DELAY_SEC", "2.0"))
+
+    results = []
+    ok = 0
+    failed = 0
+
+    for n in numbers:
+        # Insert an audit trail row first
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO call_logs (call_id, phone_number, status, summary)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("", n, "bulk_triggered", "Bulk call triggered from /bulk-call-excel."),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            logger.exception("Failed inserting bulk_triggered log row for %s", n)
+
+        # Trigger Exotel call (run sync requests.post in a thread to avoid blocking the event loop)
+        try:
+            r = await _asyncio.to_thread(exotel_outbound_call, n)
+            results.append({"phone": n, "status": "ok", "result": r})
+            ok += 1
+        except Exception as e:
+            logger.exception("Bulk call failed for %s", n)
+            results.append({"phone": n, "status": "error", "error": str(e)})
+            failed += 1
+
+        if delay_sec > 0:
+            await _asyncio.sleep(delay_sec)
+
+    return {
+        "status": "ok",
+        "phone_column_used": phone_col,
+        "total_numbers": len(numbers),
+        "called_ok": ok,
+        "called_failed": failed,
+        "delay_sec": delay_sec,
+        "results": results,
+    }
