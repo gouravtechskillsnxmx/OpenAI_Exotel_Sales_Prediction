@@ -74,6 +74,7 @@ logger = logging.getLogger("ws_server")
 
 # Preferred Exotel env var names (DO NOT CHANGE)
 EXO_SID = os.getenv("EXO_SID", "")
+EXO_API_KEY = os.getenv("EXO_API_KEY", "")
 EXO_API_TOKEN = os.getenv("EXO_API_TOKEN", "")
 EXO_FLOW_ID = os.getenv("EXO_FLOW_ID", "")
 EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")
@@ -81,13 +82,13 @@ EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")
 # Exotel outbound flow URL. If not explicitly set, build from EXO_SID + EXO_FLOW_ID when possible.
 EXOTEL_FLOW_URL = os.getenv("EXOTEL_FLOW_URL", "").strip()
 if not EXOTEL_FLOW_URL:
-    if EXO_SID and EXO_FLOW_ID:
-        EXOTEL_FLOW_URL = f"http://my.exotel.com/{EXO_SID}/exoml/start_voice/{EXO_FLOW_ID}"
+    if EXO_API_KEY  and EXO_FLOW_ID:
+        EXOTEL_FLOW_URL = f"http://my.exotel.com/{EXO_API_KEY}/exoml/start_voice/{EXO_FLOW_ID}"
     else:
         EXOTEL_FLOW_URL = "http://my.exotel.com/gouravnxmx1/exoml/start_voice/1077390"
 
 # Backward-compatible aliases used elsewhere in code (keep variable names; map to EXO_*).
-EXOTEL_SID = EXO_SID
+EXOTEL_SID = EXO_API_KEY
 EXOTEL_TOKEN = EXO_API_TOKEN
 
 EXO_SUBDOMAIN = os.getenv("EXO_SUBDOMAIN", "api")  # kept for compatibility
@@ -626,12 +627,11 @@ def exotel_outbound_call(to_number: str) -> Dict[str, Any]:
       - EXO_CALLER_ID
       - EXOTEL_FLOW_URL
     """
-    if not EXOTEL_SID or not EXOTEL_TOKEN or not EXO_CALLER_ID:
-        logger.error("Exotel env missing (EXO_SID / EXO_API_TOKEN / EXO_CALLER_ID); cannot place outbound call.")
+    if not EXO_API_KEY or not EXO_API_TOKEN or not EXO_CALLER_ID:
+        logger.error("Exotel env missing (EXO_API_KEY / EXO_API_TOKEN / EXO_CALLER_ID); cannot place outbound call.")
         return {"error": "exotel env missing"}
 
-    exotel_url = f"https://{EXOTEL_SID}:{EXOTEL_TOKEN}@api.exotel.com/v1/Accounts/{EXOTEL_SID}/Calls/connect.json"
-
+    exotel_url = f"https://{EXO_API_KEY}:{EXO_API_TOKEN}@api.exotel.com/v1/Accounts/{EXO_API_KEY}/Calls/connect.json"
     payload = {
         "From": to_number,          # customer phone (verified) – same as curl "From"
         "CallerId": EXO_CALLER_ID,  # your Exotel number – same as curl "CallerId"
