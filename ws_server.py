@@ -662,7 +662,7 @@ def exotel_outbound_call(to_number: str) -> Dict[str, Any]:
         logger.error("Exotel env missing (EXO_API_KEY / EXO_API_TOKEN / EXO_CALLER_ID); cannot place outbound call.")
         return {"error": "exotel env missing"}
 
-    exotel_url = f"https://{EXO_API_KEY}:{EXO_API_TOKEN}@api.exotel.com/v1/Accounts/{EXO_API_KEY}/Calls/connect.json"
+    exotel_url = f"https://{EXO_API_KEY}:{EXO_API_TOKEN}@api.exotel.com/v1/Accounts/{EXO_SID}/Calls/connect.json"
     payload = {
         "From": to_number,          # customer phone (verified) – same as curl "From"
         "CallerId": EXO_CALLER_ID,  # your Exotel number – same as curl "CallerId"
