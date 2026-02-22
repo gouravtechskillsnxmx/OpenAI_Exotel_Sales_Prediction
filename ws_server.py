@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse
 import os
 import sqlite3
 import time
+from zoneinfo import ZoneInfo
 from typing import Dict, Optional, Any, List
 
 import audioop
@@ -159,6 +160,32 @@ init_db()
 
 
 
+def _format_ist(ts_str: str) -> str:
+    """Convert SQLite timestamp (assumed UTC) to IST string."""
+    if not ts_str:
+        return ""
+    s = str(ts_str).strip()
+    # SQLite CURRENT_TIMESTAMP is 'YYYY-MM-DD HH:MM:SS'
+    from datetime import datetime, timezone
+    dt_obj = None
+    try:
+        dt_obj = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        try:
+            # try ISO
+            dt_obj = datetime.fromisoformat(s)
+            if dt_obj.tzinfo is None:
+                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+        except Exception:
+            return s
+    try:
+        ist = dt_obj.astimezone(ZoneInfo("Asia/Kolkata"))
+        return ist.strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        return s
+
+
+
 # ---------------------------------------------------------
 # Audio helpers (24k <-> 8k)
 # ---------------------------------------------------------
@@ -190,6 +217,9 @@ app.add_middleware(
 
 # In-memory call transcripts keyed by Exotel stream_sid
 CALL_TRANSCRIPTS: Dict[str, Dict[str, Any]] = {}
+
+# Prevent multiple bulk batches from running concurrently
+BULK_CALL_LOCK = asyncio.Lock()
 
 @app.post("/import_call_logs")
 async def import_call_logs(request: Request):
@@ -418,7 +448,7 @@ HTML_PAGE = """
               <td>${row.phone_number || ""}</td>
               <td>${row.status || ""}</td>
               <td>${(row.summary || "").slice(0, 1000)}</td>
-              <td>${row.created_at || ""}</td>
+              <td>${row.created_at_ist || row.created_at || ""}</td>
             `;
             tbody.appendChild(tr);
           }
@@ -531,6 +561,7 @@ async def get_call_logs():
             "status": r[3],
             "summary": r[4],
             "created_at": r[5],
+            "created_at_ist": _format_ist(r[5]),
         }
         for r in rows
     ]
@@ -631,7 +662,7 @@ def exotel_outbound_call(to_number: str) -> Dict[str, Any]:
         logger.error("Exotel env missing (EXO_API_KEY / EXO_API_TOKEN / EXO_CALLER_ID); cannot place outbound call.")
         return {"error": "exotel env missing"}
 
-    exotel_url = f"https://{EXO_API_KEY}:{EXO_API_TOKEN}@api.exotel.com/v1/Accounts/{EXO_SID}/Calls/connect.json"
+    exotel_url = f"https://{EXO_API_KEY}:{EXO_API_TOKEN}@api.exotel.com/v1/Accounts/{EXO_API_KEY}/Calls/connect.json"
     payload = {
         "From": to_number,          # customer phone (verified) – same as curl "From"
         "CallerId": EXO_CALLER_ID,  # your Exotel number – same as curl "CallerId"
@@ -1849,14 +1880,52 @@ async def bulk_call_excel(request: Request):
     called_ok = 0
     called_failed = 0
 
-    for n in numbers:
-        # Trigger Exotel call (run sync requests.post in a thread to avoid blocking the event loop)
-        try:
-            r = await _asyncio.to_thread(exotel_outbound_call, n)
-            # Treat {"error": "..."} as failure
-            if isinstance(r, dict) and r.get("error"):
+    async with BULK_CALL_LOCK:
+        for n in numbers:
+            # Trigger Exotel call (run sync requests.post in a thread to avoid blocking the event loop)
+            try:
+                r = await _asyncio.to_thread(exotel_outbound_call, n)
+                # Treat {"error": "..."} as failure
+                if isinstance(r, dict) and r.get("error"):
+                    called_failed += 1
+                    results.append({"phone": n, "status": "error", "error": r.get("error"), "batch_id": batch_id})
+                    if write_audit:
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cur = conn.cursor()
+                            cur.execute(
+                                """
+                                INSERT INTO call_logs (call_id, phone_number, status, summary)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                ("", n, "bulk_failed", f"bulk_batch_id={batch_id}; error={r.get('error')}"),
+                            )
+                            conn.commit()
+                            conn.close()
+                        except Exception:
+                            logger.exception("Failed inserting bulk_failed audit row for %s", n)
+                else:
+                    called_ok += 1
+                    results.append({"phone": n, "status": "ok", "result": r, "batch_id": batch_id})
+                    if write_audit:
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cur = conn.cursor()
+                            cur.execute(
+                                """
+                                INSERT INTO call_logs (call_id, phone_number, status, summary)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                ("", n, "bulk_triggered", f"bulk_batch_id={batch_id}; bulk call triggered."),
+                            )
+                            conn.commit()
+                            conn.close()
+                        except Exception:
+                            logger.exception("Failed inserting bulk_triggered audit row for %s", n)
+            except Exception as e:
+                logger.exception("Bulk call failed for %s", n)
                 called_failed += 1
-                results.append({"phone": n, "status": "error", "error": r.get("error"), "batch_id": batch_id})
+                results.append({"phone": n, "status": "error", "error": str(e), "batch_id": batch_id})
                 if write_audit:
                     try:
                         conn = sqlite3.connect(DB_PATH)
@@ -1866,53 +1935,15 @@ async def bulk_call_excel(request: Request):
                             INSERT INTO call_logs (call_id, phone_number, status, summary)
                             VALUES (?, ?, ?, ?)
                             """,
-                            ("", n, "bulk_failed", f"bulk_batch_id={batch_id}; error={r.get('error')}"),
+                            ("", n, "bulk_failed", f"bulk_batch_id={batch_id}; exception={str(e)}"),
                         )
                         conn.commit()
                         conn.close()
                     except Exception:
                         logger.exception("Failed inserting bulk_failed audit row for %s", n)
-            else:
-                called_ok += 1
-                results.append({"phone": n, "status": "ok", "result": r, "batch_id": batch_id})
-                if write_audit:
-                    try:
-                        conn = sqlite3.connect(DB_PATH)
-                        cur = conn.cursor()
-                        cur.execute(
-                            """
-                            INSERT INTO call_logs (call_id, phone_number, status, summary)
-                            VALUES (?, ?, ?, ?)
-                            """,
-                            ("", n, "bulk_triggered", f"bulk_batch_id={batch_id}; bulk call triggered."),
-                        )
-                        conn.commit()
-                        conn.close()
-                    except Exception:
-                        logger.exception("Failed inserting bulk_triggered audit row for %s", n)
-        except Exception as e:
-            logger.exception("Bulk call failed for %s", n)
-            called_failed += 1
-            results.append({"phone": n, "status": "error", "error": str(e), "batch_id": batch_id})
-            if write_audit:
-                try:
-                    conn = sqlite3.connect(DB_PATH)
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        INSERT INTO call_logs (call_id, phone_number, status, summary)
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        ("", n, "bulk_failed", f"bulk_batch_id={batch_id}; exception={str(e)}"),
-                    )
-                    conn.commit()
-                    conn.close()
-                except Exception:
-                    logger.exception("Failed inserting bulk_failed audit row for %s", n)
 
-        if delay_sec > 0:
-            await _asyncio.sleep(delay_sec)
-
+            if delay_sec > 0:
+                await _asyncio.sleep(delay_sec)
     return {
         "status": "ok",
         "bulk_batch_id": batch_id,
