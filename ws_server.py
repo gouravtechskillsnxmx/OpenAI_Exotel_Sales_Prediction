@@ -1216,8 +1216,9 @@ async def exotel_media(ws: WebSocket):
                     "type": "response.create",
                     "response": {
                         "instructions": (
-                            "Start the call now: greet the caller, introduce yourself as Financial planning agent "
-                            "Mr. Shashinath Thakur, and ask them if they have existing investment that you can review and can make it more profitable"
+                            "Start the call now: greet the caller, introduce yourself as Financial planning agent  in english"
+                            "Mr. Shashinath Thakur, and ask them if they have existing investment that you can review and can make it more profitable,"
+                            " finish introduction in 10 seconds pause let caller speak then proceed ahead "
                         ),
                         # Force audio output, not just text
                         "modalities": ["text", "audio"],
