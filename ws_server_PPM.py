@@ -296,6 +296,7 @@ async def ppm_get_voice_opening_line(
     trust_score: float = 0.4,
     fallback_text: str = "",
 ) -> str:
+    print("PPM RESPONSE:", data)
     context = ppm_build_voice_context(
         phone_number=phone_number,
         segment=segment,
@@ -308,6 +309,7 @@ async def ppm_get_voice_opening_line(
         trust_score=trust_score,
     )
     candidate = await ppm_choose_voice_candidate(context)
+    print("PPM RESPONSE:", candidate)
     message_text = (candidate or {}).get("message_text") or ""
     return message_text or fallback_text
 
