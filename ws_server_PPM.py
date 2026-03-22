@@ -283,6 +283,53 @@ async def ppm_choose_voice_candidate(context: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+async def ppm_log_voice_outcome(
+    *,
+    decision_id: Optional[int] = None,
+    phone_number: str = "",
+    lead_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    segment: str = "cold",
+    strategy_key: str = "unknown",
+    replied: bool = False,
+    converted: bool = False,
+    opted_out: bool = False,
+    revenue: float = 0.0,
+    call_duration_seconds: int = 0,
+    outcome_notes: str = "",
+) -> Dict[str, Any]:
+    if not ppm_engine_enabled():
+        return {"ok": False, "reason": "ppm_disabled"}
+
+    payload = {
+        "decision_id": decision_id,
+        "phone_number": phone_number,
+        "lead_id": lead_id,
+        "tenant_id": tenant_id,
+        "segment": segment,
+        "channel": "voice",
+        "strategy_key": strategy_key,
+        "replied": replied,
+        "converted": converted,
+        "opted_out": opted_out,
+        "revenue": revenue,
+        "call_duration_seconds": call_duration_seconds,
+        "outcome_notes": outcome_notes,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=PPM_ENGINE_TIMEOUT) as client:
+            resp = await client.post(f"{PPM_ENGINE_URL}/log-outcome", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            print("PPM OUTCOME RESPONSE:", data)
+            return data
+    except Exception:
+        logger.exception("PPM log-outcome call failed")
+
+    return {"ok": False, "reason": "ppm_outcome_error"}
+
+
 async def ppm_get_voice_opening_line(
     *,
     phone_number: str = "",
@@ -1358,8 +1405,7 @@ async def exotel_media(ws: WebSocket):
             await send_openai({"type": "session.update", "session": session_config})
             logger.info("Sent session.update with LIC persona + tools config")
 
-            # Ask the model to start the first greeting turn
-            ppm_opening_line = await ppm_get_voice_opening_line(
+            ppm_context = ppm_build_voice_context(
                 phone_number=conn_caller_number or "",
                 segment="cold",
                 time_of_day="evening",
@@ -1369,14 +1415,26 @@ async def exotel_media(ws: WebSocket):
                 prior_engagement=0.2,
                 price_sensitivity=0.5,
                 trust_score=0.4,
-                fallback_text=(
-                    "Hi sir, Shashinath bol raha hoon Mumbai se… "
-                    "ek quick observation tha — "
-                    "60% log jinke paas family hai, woh underinsured hote hain… "
-                    "just wanted to check, aapka cover adequate hai ya kabhi review nahi kiya?"
-                ),
             )
 
+            ppm_candidate = await ppm_choose_voice_candidate(ppm_context)
+
+            print("PPM RESPONSE:", ppm_candidate)
+
+            ppm_opening_line = (ppm_candidate or {}).get("message_text") or (
+                "Hi sir, Shashinath bol raha hoon Mumbai se… "
+                "ek quick observation tha — "
+                "60% log jinke paas family hai, woh underinsured hote hain… "
+                "just wanted to check, aapka cover adequate hai ya kabhi review nahi kiya?"
+            )
+
+            # store decision metadata for this call
+            if stream_sid and stream_sid in CALL_TRANSCRIPTS:
+                CALL_TRANSCRIPTS[stream_sid]["ppm_decision_id"] = (ppm_candidate or {}).get("decision_id")
+                CALL_TRANSCRIPTS[stream_sid]["ppm_strategy_key"] = (ppm_candidate or {}).get("strategy_key", "unknown")
+                CALL_TRANSCRIPTS[stream_sid]["ppm_source"] = (ppm_candidate or {}).get("source", "")
+
+            # Ask the model to start the first greeting turn
             await send_openai(
                 {
                     "type": "response.create",
@@ -1789,6 +1847,27 @@ async def exotel_media(ws: WebSocket):
                     await log_call_summary_to_db(meta_call_id, meta_phone, summary_text)
                 except Exception:
                     logger.exception("Error while calling log_call_summary_to_db from stop event")
+
+                try:
+                    ppm_decision_id = meta.get("ppm_decision_id")
+                    ppm_strategy_key = meta.get("ppm_strategy_key", "unknown")
+
+                    replied_flag = bool(duration_seconds and duration_seconds > 15)
+
+                    await ppm_log_voice_outcome(
+                        decision_id=ppm_decision_id,
+                        phone_number=meta_phone,
+                        segment="cold",
+                        strategy_key=ppm_strategy_key,
+                        replied=replied_flag,
+                        converted=False,
+                        opted_out=False,
+                        revenue=0.0,
+                        call_duration_seconds=duration_seconds or 0,
+                        outcome_notes=summary_text,
+                    )
+                except Exception:
+                    logger.exception("Failed to log outcome to PPM")
 
                 break
 
