@@ -296,7 +296,7 @@ async def ppm_get_voice_opening_line(
     trust_score: float = 0.4,
     fallback_text: str = "",
 ) -> str:
-    print("PPM RESPONSE:", data)
+    print("PPM FUNCTION CALLED")
     context = ppm_build_voice_context(
         phone_number=phone_number,
         segment=segment,
