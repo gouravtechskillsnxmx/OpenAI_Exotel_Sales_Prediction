@@ -1359,6 +1359,24 @@ async def exotel_media(ws: WebSocket):
             logger.info("Sent session.update with LIC persona + tools config")
 
             # Ask the model to start the first greeting turn
+            ppm_opening_line = await ppm_get_voice_opening_line(
+                phone_number=conn_caller_number or "",
+                segment="cold",
+                time_of_day="evening",
+                product_type="insurance",
+                urgency_level="medium",
+                lead_temperature="cold",
+                prior_engagement=0.2,
+                price_sensitivity=0.5,
+                trust_score=0.4,
+                fallback_text=(
+                    "Hi sir, Shashinath bol raha hoon Mumbai se… "
+                    "ek quick observation tha — "
+                    "60% log jinke paas family hai, woh underinsured hote hain… "
+                    "just wanted to check, aapka cover adequate hai ya kabhi review nahi kiya?"
+                ),
+            )
+
             await send_openai(
                 {
                     "type": "response.create",
@@ -1366,16 +1384,10 @@ async def exotel_media(ws: WebSocket):
                         "instructions": (
                             "Start the call now.\n"
                             "Speak in Hinglish, calm and confident tone.\n"
-                            "Use a strong, curiosity-based opener.\n"
+                            "Use the exact opening line given below.\n"
                             "Finish within 10 seconds.\n"
                             "Then STOP and listen.\n\n"
-
-                            "Say:\n"
-                            "'Hi sir, Shashinath bol raha hoon Mumbai se… "
-                            "ek quick observation tha — "
-                            "60% log jinke paas family hai, woh underinsured hote hain… "
-                            "just wanted to check, aapka cover adequate hai ya kabhi review nahi kiya?'\n\n"
-
+                            f"Say:\n'{ppm_opening_line}'\n\n"
                             "Pause after speaking."
                         ),
                         "modalities": ["text", "audio"],
