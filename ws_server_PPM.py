@@ -1852,7 +1852,7 @@ async def exotel_media(ws: WebSocket):
                     ppm_decision_id = meta.get("ppm_decision_id")
                     ppm_strategy_key = meta.get("ppm_strategy_key", "unknown")
 
-                    replied_flag = bool(duration_seconds and duration_seconds > 15)
+                    replied_flag = bool(duration_seconds and duration_seconds > 30)
 
                     await ppm_log_voice_outcome(
                         decision_id=ppm_decision_id,
