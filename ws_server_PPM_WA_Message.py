@@ -76,7 +76,7 @@ logger = logging.getLogger("ws_server")
 # Preferred Exotel env var names (DO NOT CHANGE)
 def _clean_env(value: str) -> str:
     value = (value or "").strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {""", "'"}:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"\"", "'"}:
         value = value[1:-1].strip()
     return value
 
@@ -917,7 +917,7 @@ HTML_PAGE = """
     </script>
   </body>
 </html>
-""""""
+"""
 
 
 @app.get("/", response_class=HTMLResponse)
