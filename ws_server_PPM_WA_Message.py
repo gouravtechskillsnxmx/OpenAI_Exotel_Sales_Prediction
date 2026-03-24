@@ -695,24 +695,42 @@ async def debug_sqlite_call_logs():
 
 HTML_PAGE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Exotel LIC Voicebot Dashboard</title>
     <style>
-      body { font-family: Arial, sans-serif; margin: 20px; }
-      h1, h2 { color: #333; }
+      body {
+        font-family: Arial, sans-serif;
+        margin: 20px;
+        background: #f7f9fc;
+        color: #222;
+      }
+      h1, h2 {
+        color: #333;
+      }
       .section {
-        border: 1px solid #ccc;
+        background: #fff;
+        border: 1px solid #d9e1ea;
         padding: 16px;
         margin-bottom: 24px;
         border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
       }
-      label { display: block; margin-bottom: 4px; }
-      input[type="text"], input[type="tel"] {
-        padding: 6px 8px;
+      label {
+        display: block;
+        margin-bottom: 4px;
+        font-weight: 600;
+      }
+      input[type="text"],
+      input[type="tel"] {
+        padding: 8px 10px;
         width: 260px;
-        max-width: 90%%;
+        max-width: 90%;
         margin-bottom: 8px;
+        border: 1px solid #c7d2de;
+        border-radius: 4px;
       }
       button {
         padding: 8px 12px;
@@ -726,18 +744,33 @@ HTML_PAGE = """
         background: #999;
         cursor: not-allowed;
       }
-      #call-result {
+      #call-result,
+      #mcp-result {
         margin-top: 8px;
         font-family: monospace;
         white-space: pre-wrap;
+        word-break: break-word;
       }
       table {
         border-collapse: collapse;
-        width: 100%%;
+        width: 100%;
         margin-top: 12px;
+        background: #fff;
       }
-      table, th, td { border: 1px solid #ccc; }
-      th, td { padding: 6px 8px; text-align: left; font-size: 0.9rem; }
+      table, th, td {
+        border: 1px solid #ccc;
+      }
+      th, td {
+        padding: 6px 8px;
+        text-align: left;
+        font-size: 0.9rem;
+        vertical-align: top;
+      }
+      code {
+        background: #f1f3f5;
+        padding: 2px 4px;
+        border-radius: 4px;
+      }
     </style>
   </head>
   <body>
@@ -755,10 +788,10 @@ HTML_PAGE = """
     </div>
 
     <div class="section">
-        <h2>Call Logs (Last 50)</h2>
-        <button id="refresh-logs">Refresh Logs</button>
-        <button id="download-ranked">Download Ranked Leads CSV</button>
-        <table id="logs-table">
+      <h2>Call Logs (Last 50)</h2>
+      <button id="refresh-logs" type="button">Refresh Logs</button>
+      <button id="download-ranked" type="button">Download Ranked Leads CSV</button>
+      <table id="logs-table">
         <thead>
           <tr>
             <th>ID</th>
@@ -769,8 +802,7 @@ HTML_PAGE = """
             <th>Created At</th>
           </tr>
         </thead>
-        <tbody id="logs-body">
-        </tbody>
+        <tbody id="logs-body"></tbody>
       </table>
     </div>
 
@@ -783,7 +815,7 @@ HTML_PAGE = """
         <li>Insert a dummy row into <code>call_logs</code></li>
         <li>Forward a test payload to <code>LIC_CRM_MCP_BASE_URL/test-save</code></li>
       </ul>
-      <button id="mcp-test-button">Run MCP Test</button>
+      <button id="mcp-test-button" type="button">Run MCP Test</button>
       <div id="mcp-result"></div>
     </div>
 
@@ -794,6 +826,7 @@ HTML_PAGE = """
         const btn = document.getElementById("call-button");
         const resultDiv = document.getElementById("call-result");
         const phone = phoneInput.value.trim();
+
         if (!phone) {
           resultDiv.textContent = "Please enter a phone number.";
           return;
@@ -824,6 +857,7 @@ HTML_PAGE = """
           const resp = await fetch("/call_logs");
           const data = await resp.json();
           const logs = data.call_logs || [];
+
           for (const row of logs) {
             const tr = document.createElement("tr");
             tr.innerHTML = `
@@ -848,6 +882,7 @@ HTML_PAGE = """
         const div = document.getElementById("mcp-result");
         btn.disabled = true;
         div.textContent = "Calling /test-mcp ...";
+
         try {
           const resp = await fetch("/test-mcp");
           const data = await resp.json();
@@ -859,11 +894,11 @@ HTML_PAGE = """
           btn.disabled = false;
         }
       }
+
       async function downloadRankedCsv() {
         const btn = document.getElementById("download-ranked");
         btn.disabled = true;
         try {
-          // This hits your ML endpoint and the browser will download ranked_customers.csv
           const url = "/ml/ranked-customers.csv?top_k=50";
           window.open(url, "_blank");
         } catch (e) {
@@ -873,24 +908,16 @@ HTML_PAGE = """
         }
       }
 
-      document.getElementById("single-call-form")
-        .addEventListener("submit", triggerSingleCall);
+      document.getElementById("single-call-form").addEventListener("submit", triggerSingleCall);
+      document.getElementById("refresh-logs").addEventListener("click", loadCallLogs);
+      document.getElementById("download-ranked").addEventListener("click", downloadRankedCsv);
+      document.getElementById("mcp-test-button").addEventListener("click", runMcpTest);
 
-      document.getElementById("refresh-logs")
-        .addEventListener("click", loadCallLogs);
-      
-      document.getElementById("download-ranked")
-        .addEventListener("click", downloadRankedCsv);
-    /*
-      document.getElementById("mcp-test-button")
-        .addEventListener("click", runMcpTest);
-        */
-      // Initial load
       loadCallLogs();
     </script>
   </body>
 </html>
-"""
+""""""
 
 
 @app.get("/", response_class=HTMLResponse)
