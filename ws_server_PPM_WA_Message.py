@@ -74,11 +74,59 @@ logger = logging.getLogger("ws_server")
 # ---------------------------------------------------------
 
 # Preferred Exotel env var names (DO NOT CHANGE)
-EXO_SID = os.getenv("EXO_SID", "")
-EXO_API_KEY = os.getenv("EXO_API_KEY", "")
-EXO_API_TOKEN = os.getenv("EXO_API_TOKEN", "")
-EXO_FLOW_ID = os.getenv("EXO_FLOW_ID", "")
-EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")
+def _clean_env(value: str) -> str:
+    value = (value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {""", "'"}:
+        value = value[1:-1].strip()
+    return value
+
+
+def _mask_secret(value: str, keep: int = 4) -> str:
+    value = _clean_env(value)
+    if not value:
+        return "<empty>"
+    if len(value) <= keep * 2:
+        return "*" * len(value)
+    return f"{value[:keep]}...{value[-keep:]}"
+
+
+def normalize_whatsapp_number(number: str, default_country_code: str = "91") -> str:
+    raw = _clean_env(number)
+    if not raw:
+        return ""
+    if raw.lower().startswith("whatsapp:"):
+        suffix = raw.split(":", 1)[1]
+        digits = re.sub(r"\D", "", suffix)
+    else:
+        digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return ""
+    if digits.startswith("00"):
+        digits = digits[2:]
+    elif digits.startswith("0") and len(digits) == 11:
+        digits = default_country_code + digits[1:]
+    elif len(digits) == 10:
+        digits = default_country_code + digits
+    return f"whatsapp:+{digits}"
+
+
+def build_exotel_basic_auth_header() -> str:
+    explicit = _clean_env(os.getenv("EXOTEL_AUTHORIZATION_BASIC", ""))
+    if explicit:
+        if explicit.lower().startswith("basic "):
+            return explicit
+        return f"Basic {explicit}"
+    if not EXO_API_KEY or not EXO_API_TOKEN:
+        return ""
+    token = base64.b64encode(f"{EXO_API_KEY}:{EXO_API_TOKEN}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+EXO_SID = _clean_env(os.getenv("EXO_SID", "") or os.getenv("EXOTEL_SID", ""))
+EXO_API_KEY = _clean_env(os.getenv("EXO_API_KEY", "") or os.getenv("EXOTEL_API_KEY", ""))
+EXO_API_TOKEN = _clean_env(os.getenv("EXO_API_TOKEN", "") or os.getenv("EXOTEL_TOKEN", ""))
+EXO_FLOW_ID = _clean_env(os.getenv("EXO_FLOW_ID", ""))
+EXO_CALLER_ID = _clean_env(os.getenv("EXO_CALLER_ID", ""))
 
 # Exotel outbound flow URL. If not explicitly set, build from EXO_SID + EXO_FLOW_ID when possible.
 EXOTEL_FLOW_URL = os.getenv("EXOTEL_FLOW_URL", "").strip()
@@ -113,11 +161,11 @@ DB_PATH = os.getenv("DB_PATH", "/tmp/call_logs.db")
 # ---------------------------------------------------------
 
 SEND_WHATSAPP_AFTER_CALL = os.getenv("SEND_WHATSAPP_AFTER_CALL", "0").strip().lower() in {"1", "true", "yes", "on"}
-EXOTEL_WHATSAPP_API_BASE = (os.getenv("EXOTEL_WHATSAPP_API_BASE") or "").strip()
-EXOTEL_WHATSAPP_FROM = (os.getenv("EXOTEL_WHATSAPP_FROM") or "").strip()
-EXOTEL_WHATSAPP_TEMPLATE_NAME = (os.getenv("EXOTEL_WHATSAPP_TEMPLATE_NAME") or "").strip()
-EXOTEL_WHATSAPP_TEMPLATE_LANGUAGE = (os.getenv("EXOTEL_WHATSAPP_TEMPLATE_LANGUAGE") or "en").strip()
-EXOTEL_WHATSAPP_STATUS_CALLBACK = (os.getenv("EXOTEL_WHATSAPP_STATUS_CALLBACK") or "").strip()
+EXOTEL_WHATSAPP_API_BASE = _clean_env(os.getenv("EXOTEL_WHATSAPP_API_BASE") or "")
+EXOTEL_WHATSAPP_FROM = normalize_whatsapp_number(os.getenv("EXOTEL_WHATSAPP_FROM") or "")
+EXOTEL_WHATSAPP_TEMPLATE_NAME = _clean_env(os.getenv("EXOTEL_WHATSAPP_TEMPLATE_NAME") or "")
+EXOTEL_WHATSAPP_TEMPLATE_LANGUAGE = _clean_env(os.getenv("EXOTEL_WHATSAPP_TEMPLATE_LANGUAGE") or "en")
+EXOTEL_WHATSAPP_STATUS_CALLBACK = _clean_env(os.getenv("EXOTEL_WHATSAPP_STATUS_CALLBACK") or "")
 
 
 def whatsapp_followup_enabled() -> bool:
@@ -173,15 +221,40 @@ async def send_exotel_whatsapp_message(
 
     api_base = EXOTEL_WHATSAPP_API_BASE or "https://api.in.exotel.com"
     url = f"{api_base}/v2/accounts/{EXO_SID}/messages"
+    normalized_to = normalize_whatsapp_number(to_number)
+    auth_header = build_exotel_basic_auth_header()
 
-    headers = {"Content-Type": "application/json"}
+    if not auth_header:
+        logger.error(
+            "Exotel WhatsApp follow-up skipped: missing auth. EXO_SID=%s EXO_API_KEY=%s EXO_API_TOKEN=%s",
+            _mask_secret(EXO_SID),
+            _mask_secret(EXO_API_KEY),
+            _mask_secret(EXO_API_TOKEN),
+        )
+        return {
+            "ok": False,
+            "reason": "missing_exotel_auth",
+        }
+
+    if not normalized_to:
+        logger.error("Exotel WhatsApp follow-up skipped: could not normalize destination number: %s", to_number)
+        return {
+            "ok": False,
+            "reason": "invalid_to_number",
+            "to_number": to_number,
+        }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": auth_header,
+    }
     payload: Dict[str, Any] = {
         "custom_data": custom_data or "",
         "whatsapp": {
             "messages": [
                 {
                     "from": EXOTEL_WHATSAPP_FROM,
-                    "to": to_number,
+                    "to": normalized_to,
                 }
             ]
         },
@@ -207,10 +280,17 @@ async def send_exotel_whatsapp_message(
             },
         }
 
-    logger.info("Sending Exotel WhatsApp follow-up to %s", to_number)
+    logger.info(
+        "Sending Exotel WhatsApp follow-up to %s via %s (sid=%s key=%s from=%s)",
+        normalized_to,
+        api_base,
+        _mask_secret(EXO_SID),
+        _mask_secret(EXO_API_KEY),
+        EXOTEL_WHATSAPP_FROM,
+    )
 
     try:
-        async with httpx.AsyncClient(timeout=20.0, auth=(EXO_API_KEY, EXO_API_TOKEN)) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
             text = resp.text
             try:
@@ -220,8 +300,28 @@ async def send_exotel_whatsapp_message(
             if resp.is_success:
                 logger.info("Exotel WhatsApp follow-up sent: status=%s body=%s", resp.status_code, text)
                 return {"ok": True, "status_code": resp.status_code, "data": data}
-            logger.error("Exotel WhatsApp follow-up failed: status=%s body=%s", resp.status_code, text)
-            return {"ok": False, "status_code": resp.status_code, "data": data, "raw": text}
+            logger.error(
+                "Exotel WhatsApp follow-up failed: status=%s body=%s auth_header_present=%s to=%s from=%s",
+                resp.status_code,
+                text,
+                bool(auth_header),
+                normalized_to,
+                EXOTEL_WHATSAPP_FROM,
+            )
+            return {
+                "ok": False,
+                "status_code": resp.status_code,
+                "data": data,
+                "raw": text,
+                "debug": {
+                    "url": url,
+                    "to": normalized_to,
+                    "from": EXOTEL_WHATSAPP_FROM,
+                    "sid_masked": _mask_secret(EXO_SID),
+                    "api_key_masked": _mask_secret(EXO_API_KEY),
+                    "auth_header_present": bool(auth_header),
+                },
+            }
     except Exception as e:
         logger.exception("Exotel WhatsApp follow-up exception")
         return {"ok": False, "reason": str(e)}
