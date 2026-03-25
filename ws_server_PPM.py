@@ -1421,12 +1421,15 @@ async def exotel_media(ws: WebSocket):
 
             print("PPM RESPONSE:", ppm_candidate)
 
-            ppm_opening_line = (ppm_candidate or {}).get("message_text") or (
-                "Hi sir, Shashinath bol raha hoon Mumbai se… "
-                "ek quick observation tha — "
-                "60% log jinke paas family hai, woh underinsured hote hain… "
-                "just wanted to check, aapka cover adequate hai ya kabhi review nahi kiya?"
-            )
+            ppm_opening_line = (ppm_candidate or {}).get("message_text")
+
+            if not ppm_opening_line:
+                print("⚠️ PPM FAILED — using fallback (should be rare)")
+
+                ppm_opening_line = (
+                    "Sir ek second — agar main galat hoon toh aap turant cut kar dena,"
+                    "bas ek quick check karna tha — aapka insurance recently review hua hai kya?"
+                )
 
             # store decision metadata for this call
             if stream_sid and stream_sid in CALL_TRANSCRIPTS:
