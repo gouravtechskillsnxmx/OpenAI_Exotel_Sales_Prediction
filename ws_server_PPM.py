@@ -56,7 +56,15 @@ import pandas as pd
 from fastapi import Query
 from fastapi.responses import StreamingResponse
 from sklearn.feature_extraction.text import TfidfVectorizer
+from ppm.storage import (
+    init_ppm_db,
+    save_ppm_decision,
+    save_ppm_outcome,
+    save_ppm_debug_event,
+    get_debug_events,
+)
 
+init_ppm_db()
 
 # ---------------------------------------------------------
 # Logging setup
@@ -467,6 +475,12 @@ async def debug_sqlite_call_logs():
     )
     rows = cur.fetchall()
     conn.close()
+    return {"rows": rows}
+
+
+@app.get("/debug/ppm-events")
+async def debug_ppm_events(limit: int = 200):
+    rows = get_debug_events(limit=limit)
     return {"rows": rows}
 
 
@@ -1209,6 +1223,7 @@ async def exotel_media(ws: WebSocket):
     stream_sid: Optional[str] = None
     call_start_ts: Optional[float] = None
     had_audio: bool = False
+    first_media_logged: bool = False
     # NEW: transcript capture buffers (Option B)
     ai_transcript_texts: list[str] = []
     summary_saved: bool = False  # tracks if model already saved summary
@@ -1303,6 +1318,16 @@ async def exotel_media(ws: WebSocket):
             logger.info("Connecting to OpenAI Realtime WS...")
             openai_ws = await openai_session.ws_connect(url, headers=headers)
             logger.info("OpenAI Realtime WS connected.")
+            save_ppm_debug_event(
+                call_id=conn_call_id or "",
+                stream_sid=stream_sid or "",
+                phone_number=conn_caller_number or "",
+                event_type="openai_connected",
+                level="INFO",
+                source="voicebot",
+                message="OpenAI Realtime websocket connected",
+                payload={"model": REALTIME_MODEL},
+            )
 
             # Build instructions for LIC agent persona
             instructions_text = (
@@ -1399,6 +1424,15 @@ async def exotel_media(ws: WebSocket):
             # Send initial session.update
             await send_openai({"type": "session.update", "session": session_config})
             logger.info("Sent session.update with LIC persona + tools config")
+            save_ppm_debug_event(
+                call_id=conn_call_id or "",
+                stream_sid=stream_sid or "",
+                phone_number=conn_caller_number or "",
+                event_type="openai_session_update",
+                level="INFO",
+                source="voicebot",
+                message="session.update sent to OpenAI",
+            )
 
             ppm_context = ppm_build_voice_context(
                 phone_number=conn_caller_number or "",
@@ -1418,6 +1452,32 @@ async def exotel_media(ws: WebSocket):
 
             ppm_opening_line = (ppm_candidate or {}).get("message_text")
 
+            save_ppm_decision(
+                call_id=conn_call_id or "",
+                phone_number=conn_caller_number or "",
+                decision_id=str((ppm_candidate or {}).get("decision_id") or ""),
+                strategy_key=(ppm_candidate or {}).get("strategy_key", "") or "",
+                selected_message=(ppm_candidate or {}).get("message_text", "") or "",
+                predicted_conversion=float((ppm_candidate or {}).get("pred_conv") or 0.0),
+                predicted_optout=float((ppm_candidate or {}).get("pred_optout") or 0.0),
+                expected_value=float((ppm_candidate or {}).get("expected_value") or 0.0),
+                source=(ppm_candidate or {}).get("source", "voice") or "voice",
+            )
+
+            save_ppm_debug_event(
+                call_id=conn_call_id or "",
+                stream_sid=stream_sid or "",
+                phone_number=conn_caller_number or "",
+                event_type="ppm_candidate_selected",
+                level="INFO",
+                source="ppm",
+                message="PPM candidate selected in connect_openai",
+                payload={
+                    "ppm_candidate": ppm_candidate,
+                    "ppm_context": ppm_context,
+                },
+            )
+
             if not ppm_opening_line:
                 print("⚠️ PPM FAILED — using fallback (should be rare)")
 
@@ -1425,6 +1485,22 @@ async def exotel_media(ws: WebSocket):
                     "Sir ek second — agar main galat hoon toh aap turant cut kar dena,"
                     "bas ek quick check karna tha — aapka insurance recently review hua hai kya?"
                 )
+
+            save_ppm_debug_event(
+                call_id=conn_call_id or "",
+                stream_sid=stream_sid or "",
+                phone_number=conn_caller_number or "",
+                event_type="ppm_opening_line_final",
+                level="INFO",
+                source="ppm",
+                message="Final opening line selected for call",
+                payload={
+                    "opening_line": ppm_opening_line,
+                    "used_fallback": not bool((ppm_candidate or {}).get("message_text")),
+                    "decision_id": (ppm_candidate or {}).get("decision_id"),
+                    "strategy_key": (ppm_candidate or {}).get("strategy_key"),
+                },
+            )
 
             # store decision metadata for this call
             if stream_sid and stream_sid in CALL_TRANSCRIPTS:
@@ -1574,6 +1650,30 @@ async def exotel_media(ws: WebSocket):
                                 conn.commit()
                                 conn.close()
 
+                                save_ppm_outcome(
+                                    call_id=call_id_param or "",
+                                    phone_number=phone_param or "",
+                                    outcome_status="completed",
+                                    reward_value=0.0,
+                                    summary=summary_param,
+                                    duration_seconds=float(duration_seconds or 0),
+                                )
+
+                                save_ppm_debug_event(
+                                    call_id=call_id_param or "",
+                                    stream_sid=stream_sid or "",
+                                    phone_number=phone_param or "",
+                                    event_type="call_summary_saved",
+                                    level="INFO",
+                                    source="voicebot",
+                                    message="Model-generated call summary saved",
+                                    payload={
+                                        "status": "completed",
+                                        "summary": summary_param,
+                                        "duration_seconds": duration_seconds,
+                                    },
+                                )
+
                                 # Forward REAL summary to MCP Postgres DB
                                 await log_call_summary_to_db(
                                     call_id_param,
@@ -1626,14 +1726,42 @@ async def exotel_media(ws: WebSocket):
 
                         elif et == "error":
                             logger.error("OpenAI ERROR event: %s", evt)
+                            save_ppm_debug_event(
+                                call_id=conn_call_id or "",
+                                stream_sid=stream_sid or "",
+                                phone_number=conn_caller_number or "",
+                                event_type="openai_error_event",
+                                level="ERROR",
+                                source="voicebot",
+                                message="OpenAI error event received",
+                                payload=evt,
+                            )
 
                 except Exception as e:
                     logger.exception("Pump error: %s", e)
+                    save_ppm_debug_event(
+                        call_id=conn_call_id or "",
+                        stream_sid=stream_sid or "",
+                        phone_number=conn_caller_number or "",
+                        event_type="pump_error",
+                        level="ERROR",
+                        source="voicebot",
+                        message=str(e),
+                    )
 
             pump_task = asyncio.create_task(pump())
 
         except Exception as e:
             logger.exception("OpenAI connection error: %s", e)
+            save_ppm_debug_event(
+                call_id=conn_call_id or "",
+                stream_sid=stream_sid or "",
+                phone_number=conn_caller_number or "",
+                event_type="openai_connection_error",
+                level="ERROR",
+                source="voicebot",
+                message=str(e),
+            )
 
     try:
         openai_started = False
@@ -1677,6 +1805,17 @@ async def exotel_media(ws: WebSocket):
                     "turns": [],  # list of (speaker, text)
                 }
 
+                save_ppm_debug_event(
+                    call_id=call_id or "",
+                    stream_sid=stream_sid or "",
+                    phone_number=caller_number or "",
+                    event_type="exotel_start",
+                    level="INFO",
+                    source="voicebot",
+                    message="Exotel start event received",
+                    payload=evt,
+                )
+
                 try:
                     await log_call_summary_to_db(
                         call_id or stream_sid or "unknown_call",
@@ -1702,6 +1841,18 @@ async def exotel_media(ws: WebSocket):
                     try:
                         pcm8 = base64.b64decode(payload_b64)
                         had_audio = True   # NEW
+                        if not first_media_logged:
+                            first_media_logged = True
+                            save_ppm_debug_event(
+                                call_id=call_id or "",
+                                stream_sid=stream_sid or "",
+                                phone_number=caller_number or "",
+                                event_type="exotel_first_media",
+                                level="INFO",
+                                source="voicebot",
+                                message="First caller audio frame received",
+                                payload={"payload_bytes": len(pcm8)},
+                            )
                     except Exception:
                         logger.warning("Invalid base64 in Exotel media payload")
                         continue
@@ -1842,6 +1993,31 @@ async def exotel_media(ws: WebSocket):
                 conn.commit()
                 conn.close()
 
+                save_ppm_outcome(
+                    call_id=meta_call_id or "",
+                    phone_number=meta_phone or "",
+                    outcome_status="stopped",
+                    reward_value=0.0,
+                    summary=summary_text,
+                    duration_seconds=float(duration_seconds or 0),
+                )
+
+                save_ppm_debug_event(
+                    call_id=meta_call_id or "",
+                    stream_sid=stream_sid or "",
+                    phone_number=meta_phone or "",
+                    event_type="exotel_stop",
+                    level="INFO",
+                    source="voicebot",
+                    message="Call stopped and fallback/final summary saved",
+                    payload={
+                        "had_audio": had_audio,
+                        "summary_saved": summary_saved,
+                        "duration_seconds": duration_seconds,
+                        "summary_text": summary_text,
+                    },
+                )
+
                 # Also log summary to MCP Postgres DB (best-effort)
                 try:
                     await log_call_summary_to_db(meta_call_id, meta_phone, summary_text)
@@ -1873,8 +2049,26 @@ async def exotel_media(ws: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("Exotel WebSocket disconnected")
+        save_ppm_debug_event(
+            call_id=call_id or "",
+            stream_sid=stream_sid or "",
+            phone_number=caller_number or "",
+            event_type="exotel_websocket_disconnected",
+            level="INFO",
+            source="voicebot",
+            message="Exotel WebSocket disconnected",
+        )
     except Exception as e:
         logger.exception("Exception in /exotel-media: %s", e)
+        save_ppm_debug_event(
+            call_id=call_id or "",
+            stream_sid=stream_sid or "",
+            phone_number=caller_number or "",
+            event_type="exotel_media_exception",
+            level="ERROR",
+            source="voicebot",
+            message=str(e),
+        )
     finally:
         if pump_task:
             pump_task.cancel()
