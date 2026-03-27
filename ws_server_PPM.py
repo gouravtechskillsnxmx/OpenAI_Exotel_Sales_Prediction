@@ -56,13 +56,21 @@ import pandas as pd
 from fastapi import Query
 from fastapi.responses import StreamingResponse
 from sklearn.feature_extraction.text import TfidfVectorizer
-from ppm.storage import (
-    init_ppm_db,
-    save_ppm_decision,
-    save_ppm_outcome,
-    save_ppm_debug_event,
-    get_debug_events,
-)
+
+try:
+    from ppm.storage import (
+        init_ppm_db,
+        save_ppm_decision,
+        save_ppm_outcome,
+        save_ppm_debug_event,
+        get_debug_events,
+    )
+except ModuleNotFoundError:
+    init_ppm_db = None
+    save_ppm_decision = None
+    save_ppm_outcome = None
+    save_ppm_debug_event = None
+    get_debug_events = None
 
 init_ppm_db()
 
