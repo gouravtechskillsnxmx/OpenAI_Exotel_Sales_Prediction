@@ -388,6 +388,50 @@ async def ppm_test_choose():
     }
 
 
+# ---------------------------------------------------------
+# Remote PPM Engine web-service helpers (added only; existing flow unchanged)
+# ---------------------------------------------------------
+
+async def ppm_engine_post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not PPM_ENGINE_URL:
+        raise RuntimeError("PPM_ENGINE_URL is not set")
+
+    url = f"{PPM_ENGINE_URL}{endpoint}"
+    async with httpx.AsyncClient(timeout=PPM_ENGINE_TIMEOUT) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def ppm_log_decision_remote(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await ppm_engine_post("/ppm/log-decision", payload)
+
+
+async def ppm_log_debug_event_remote(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await ppm_engine_post("/ppm/log-debug-event", payload)
+
+
+async def ppm_log_outcome_remote(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await ppm_engine_post("/ppm/log-outcome", payload)
+
+
+@app.get("/ppm/remote-health")
+async def ppm_remote_health():
+    if not ppm_engine_enabled():
+        return {"ok": False, "reason": "ppm_engine_disabled"}
+    try:
+        async with httpx.AsyncClient(timeout=PPM_ENGINE_TIMEOUT) as client:
+            resp = await client.get(f"{PPM_ENGINE_URL}/health")
+            return {
+                "ok": resp.is_success,
+                "status_code": resp.status_code,
+                "body": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text,
+            }
+    except Exception as e:
+        logger.exception("Remote PPM health check failed")
+        return {"ok": False, "reason": str(e)}
+
+
 # In-memory call transcripts keyed by Exotel stream_sid
 CALL_TRANSCRIPTS: Dict[str, Dict[str, Any]] = {}
 
@@ -1329,6 +1373,21 @@ async def exotel_media(ws: WebSocket):
                 payload={"model": REALTIME_MODEL},
             )
 
+            try:
+                await ppm_log_debug_event_remote({
+                    "client_id": "lic_shashinath",
+                    "channel": "voice",
+                    "call_id": conn_call_id or "",
+                    "stream_sid": stream_sid or "",
+                    "phone_number": conn_caller_number or "",
+                    "event_type": "openai_connected",
+                    "level": "INFO",
+                    "message": "OpenAI realtime websocket connected",
+                    "payload": {"model": REALTIME_MODEL},
+                })
+            except Exception:
+                logger.exception("Remote PPM log-debug-event failed (openai_connected)")
+
             # Build instructions for LIC agent persona
             instructions_text = (
                 "You are Mr. Shashinath Thakur, a highly experienced Financial planner with 25 years of experience.\n\n"
@@ -1434,6 +1493,21 @@ async def exotel_media(ws: WebSocket):
                 message="session.update sent to OpenAI",
             )
 
+            try:
+                await ppm_log_debug_event_remote({
+                    "client_id": "lic_shashinath",
+                    "channel": "voice",
+                    "call_id": conn_call_id or "",
+                    "stream_sid": stream_sid or "",
+                    "phone_number": conn_caller_number or "",
+                    "event_type": "openai_session_update",
+                    "level": "INFO",
+                    "message": "session.update sent to OpenAI",
+                    "payload": {},
+                })
+            except Exception:
+                logger.exception("Remote PPM log-debug-event failed (openai_session_update)")
+
             ppm_context = ppm_build_voice_context(
                 phone_number=conn_caller_number or "",
                 segment="cold",
@@ -1477,6 +1551,24 @@ async def exotel_media(ws: WebSocket):
                     "ppm_context": ppm_context,
                 },
             )
+
+            try:
+                await ppm_log_decision_remote({
+                    "client_id": "lic_shashinath",
+                    "channel": "voice",
+                    "journey_id": "voice_opening",
+                    "call_id": conn_call_id or "",
+                    "phone_number": conn_caller_number or "",
+                    "decision_id": str((ppm_candidate or {}).get("decision_id") or ""),
+                    "strategy_key": (ppm_candidate or {}).get("strategy_key", "") or "",
+                    "message_text": (ppm_candidate or {}).get("message_text", "") or "",
+                    "predicted_conversion": float((ppm_candidate or {}).get("pred_conv") or 0.0),
+                    "predicted_optout": float((ppm_candidate or {}).get("pred_optout") or 0.0),
+                    "expected_value": float((ppm_candidate or {}).get("expected_value") or 0.0),
+                    "context": ppm_context,
+                })
+            except Exception:
+                logger.exception("Remote PPM log-decision failed")
 
             if not ppm_opening_line:
                 print("⚠️ PPM FAILED — using fallback (should be rare)")
@@ -1674,6 +1766,41 @@ async def exotel_media(ws: WebSocket):
                                     },
                                 )
 
+
+                                try:
+                                    await ppm_log_debug_event_remote({
+                                        "client_id": "lic_shashinath",
+                                        "channel": "voice",
+                                        "call_id": call_id_param or "",
+                                        "stream_sid": stream_sid or "",
+                                        "phone_number": phone_param or "",
+                                        "event_type": "call_summary_saved",
+                                        "level": "INFO",
+                                        "message": "Model-generated call summary saved",
+                                        "payload": {
+                                            "status": "completed",
+                                            "summary": summary_param,
+                                            "duration_seconds": duration_seconds,
+                                        },
+                                    })
+                                except Exception:
+                                    logger.exception("Remote PPM log-debug-event failed (call_summary_saved)")
+
+                                try:
+                                    await ppm_log_outcome_remote({
+                                        "client_id": "lic_shashinath",
+                                        "channel": "voice",
+                                        "call_id": call_id_param or "",
+                                        "phone_number": phone_param or "",
+                                        "decision_id": str((ppm_candidate or {}).get("decision_id") or ""),
+                                        "outcome_status": "completed",
+                                        "reward_value": 0.0,
+                                        "summary": summary_param,
+                                        "duration_seconds": float(duration_seconds or 0),
+                                    })
+                                except Exception:
+                                    logger.exception("Remote PPM log-outcome failed (call_summary_saved)")
+
                                 # Forward REAL summary to MCP Postgres DB
                                 await log_call_summary_to_db(
                                     call_id_param,
@@ -1817,6 +1944,21 @@ async def exotel_media(ws: WebSocket):
                 )
 
                 try:
+                    await ppm_log_debug_event_remote({
+                        "client_id": "lic_shashinath",
+                        "channel": "voice",
+                        "call_id": call_id or "",
+                        "stream_sid": stream_sid or "",
+                        "phone_number": caller_number or "",
+                        "event_type": "exotel_start",
+                        "level": "INFO",
+                        "message": "Exotel start event received",
+                        "payload": evt,
+                    })
+                except Exception:
+                    logger.exception("Remote PPM log-debug-event failed (exotel_start)")
+
+                try:
                     await log_call_summary_to_db(
                         call_id or stream_sid or "unknown_call",
                         caller_number or "",
@@ -1853,6 +1995,21 @@ async def exotel_media(ws: WebSocket):
                                 message="First caller audio frame received",
                                 payload={"payload_bytes": len(pcm8)},
                             )
+
+                            try:
+                                await ppm_log_debug_event_remote({
+                                    "client_id": "lic_shashinath",
+                                    "channel": "voice",
+                                    "call_id": call_id or "",
+                                    "stream_sid": stream_sid or "",
+                                    "phone_number": caller_number or "",
+                                    "event_type": "exotel_first_media",
+                                    "level": "INFO",
+                                    "message": "First caller audio frame received",
+                                    "payload": {"payload_bytes": len(pcm8)},
+                                })
+                            except Exception:
+                                logger.exception("Remote PPM log-debug-event failed (exotel_first_media)")
                     except Exception:
                         logger.warning("Invalid base64 in Exotel media payload")
                         continue
@@ -2017,6 +2174,42 @@ async def exotel_media(ws: WebSocket):
                         "summary_text": summary_text,
                     },
                 )
+
+
+                try:
+                    await ppm_log_debug_event_remote({
+                        "client_id": "lic_shashinath",
+                        "channel": "voice",
+                        "call_id": meta_call_id or "",
+                        "stream_sid": stream_sid or "",
+                        "phone_number": meta_phone or "",
+                        "event_type": "exotel_stop",
+                        "level": "INFO",
+                        "message": "Call stopped and fallback/final summary saved",
+                        "payload": {
+                            "had_audio": had_audio,
+                            "summary_saved": summary_saved,
+                            "duration_seconds": duration_seconds,
+                            "summary_text": summary_text,
+                        },
+                    })
+                except Exception:
+                    logger.exception("Remote PPM log-debug-event failed (exotel_stop)")
+
+                try:
+                    await ppm_log_outcome_remote({
+                        "client_id": "lic_shashinath",
+                        "channel": "voice",
+                        "call_id": meta_call_id or "",
+                        "phone_number": meta_phone or "",
+                        "decision_id": str(meta.get("ppm_decision_id") or ""),
+                        "outcome_status": "stopped",
+                        "reward_value": 0.0,
+                        "summary": summary_text,
+                        "duration_seconds": float(duration_seconds or 0),
+                    })
+                except Exception:
+                    logger.exception("Remote PPM log-outcome failed (exotel_stop)")
 
                 # Also log summary to MCP Postgres DB (best-effort)
                 try:
