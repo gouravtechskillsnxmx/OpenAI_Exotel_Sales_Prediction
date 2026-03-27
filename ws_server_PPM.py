@@ -56,21 +56,24 @@ import pandas as pd
 from fastapi import Query
 from fastapi.responses import StreamingResponse
 from sklearn.feature_extraction.text import TfidfVectorizer
+# Local ppm.storage import removed from voice-bot service.
+# PPM storage belongs to the remote PPM Engine web service.
+# Keep same function names here as no-op shims so the existing working
+# voice-bot flow does not break while remote PPM calls are used in parallel.
+def init_ppm_db():
+    return None
 
-try:
-    from ppm.storage import (
-        init_ppm_db,
-        save_ppm_decision,
-        save_ppm_outcome,
-        save_ppm_debug_event,
-        get_debug_events,
-    )
-except ModuleNotFoundError:
-    init_ppm_db = None
-    save_ppm_decision = None
-    save_ppm_outcome = None
-    save_ppm_debug_event = None
-    get_debug_events = None
+def save_ppm_decision(*args, **kwargs):
+    return None
+
+def save_ppm_outcome(*args, **kwargs):
+    return None
+
+def save_ppm_debug_event(*args, **kwargs):
+    return None
+
+def get_debug_events(*args, **kwargs):
+    return []
 
 init_ppm_db()
 
