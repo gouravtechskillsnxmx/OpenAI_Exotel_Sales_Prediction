@@ -56,26 +56,23 @@ import pandas as pd
 from fastapi import Query
 from fastapi.responses import StreamingResponse
 from sklearn.feature_extraction.text import TfidfVectorizer
-# Local ppm.storage import removed from voice-bot service.
-# PPM storage belongs to the remote PPM Engine web service.
-# Keep same function names here as no-op shims so the existing working
-# voice-bot flow does not break while remote PPM calls are used in parallel.
-def init_ppm_db():
-    return None
 
-def save_ppm_decision(*args, **kwargs):
-    return None
+try:
+    from ppm.storage import (
+        init_ppm_db,
+        save_ppm_decision,
+        save_ppm_outcome,
+        save_ppm_debug_event,
+        get_debug_events,
+    )
+except ModuleNotFoundError:
+    init_ppm_db = None
+    save_ppm_decision = None
+    save_ppm_outcome = None
+    save_ppm_debug_event = None
+    get_debug_events = None
 
-def save_ppm_outcome(*args, **kwargs):
-    return None
 
-def save_ppm_debug_event(*args, **kwargs):
-    return None
-
-def get_debug_events(*args, **kwargs):
-    return []
-
-init_ppm_db()
 
 # ---------------------------------------------------------
 # Logging setup
@@ -378,6 +375,110 @@ async def ppm_get_voice_opening_line(
     print("PPM RESPONSE:", candidate)
     message_text = (candidate or {}).get("message_text") or ""
     return message_text or fallback_text
+
+
+def ppm_build_voice_opening_package_local(
+    *,
+    phone_number: str = "",
+    lead_name: str = "",
+    industry: str = "insurance",
+    product_type: str = "insurance",
+    journey_stage: str = "cold",
+) -> Dict[str, Any]:
+    """
+    Additive local voice-opening package.
+    Does not remove or rename any existing variable / flow.
+    Keeps opening short, human, and authority-based without long monologue.
+    """
+    safe_lead_name = (lead_name or "").strip()
+    safe_industry = (industry or "").strip().lower()
+    safe_product_type = (product_type or "").strip().lower()
+    safe_journey_stage = (journey_stage or "").strip().lower()
+
+    if safe_lead_name:
+        primary_opening = (
+            f"Hello {safe_lead_name}... Shashinath bol raha hoon, financial planning side se. "
+            "Ek quick yes-no question tha — aapka life cover active hai?"
+        )
+    elif safe_industry == "insurance" or safe_product_type == "insurance":
+        primary_opening = (
+            "Hello... Shashinath bol raha hoon, financial planning side se. "
+            "Ek quick yes-no question tha — aapka life cover active hai?"
+        )
+    else:
+        primary_opening = (
+            "Hello... Shashinath bol raha hoon. "
+            "Ek quick yes-no question tha — kya abhi baat karna convenient hai?"
+        )
+
+    followup_identity = "Main Shashinath bol raha hoon, financial planning side se."
+    followup_context = (
+        "Bas isliye pooch raha tha kyunki kaafi families ka cover adequate nahi hota."
+    )
+    followup_question = "Aapne last time apna cover kab review kiya tha?"
+    whatsapp_transition = (
+        "Agar aap chaho toh main WhatsApp par ek short coverage check bhej deta hoon."
+    )
+
+    interruption_map = {
+        "kaun": "Main Shashinath bol raha hoon, financial planning side se. Bas quick insurance check tha.",
+        "kaun bol rahe ho": "Main Shashinath bol raha hoon, financial planning side se.",
+        "busy": "No problem sir, main WhatsApp par ek short useful message bhej deta hoon.",
+        "later": "Theek hai sir, main WhatsApp par ek short useful message bhej deta hoon.",
+        "abhi nahi": "Theek hai sir, main WhatsApp par ek short useful message bhej deta hoon.",
+        "nahi chahiye": "Bilkul theek sir, force nahi karunga. Main ek short check WhatsApp par bhej deta hoon.",
+        "kya hai": "Bas quick insurance coverage check tha, detail mein nahi jaunga.",
+        "already policy": "Achha hai sir. Aapne uska last review kab kiya tha?",
+    }
+
+    return {
+        "primary_opening": primary_opening,
+        "followup_identity": followup_identity,
+        "followup_context": followup_context,
+        "followup_question": followup_question,
+        "whatsapp_transition": whatsapp_transition,
+        "interruption_map": interruption_map,
+        "metadata": {
+            "phone_number": phone_number,
+            "industry": safe_industry,
+            "product_type": safe_product_type,
+            "journey_stage": safe_journey_stage,
+        },
+    }
+
+
+def ppm_normalize_voice_opening_line_local(
+    opening_line: str,
+    voice_opening_package: Dict[str, Any],
+) -> str:
+    """
+    Additive normalization only.
+    Keeps existing variable names untouched and avoids deleting existing logic.
+    """
+    normalized_opening_line = (opening_line or "").strip()
+    fallback_opening_line = (voice_opening_package or {}).get("primary_opening") or ""
+
+    if not normalized_opening_line:
+        return fallback_opening_line
+
+    normalized_lower = normalized_opening_line.lower()
+
+    # If PPM returns a very long ad-like opener, safely compress to the authority+question form.
+    if len(normalized_opening_line) > 180:
+        return fallback_opening_line
+
+    long_sales_markers = [
+        "25 years",
+        "mumbai branch",
+        "5 mins",
+        "5 minutes",
+        "underinsured hote hain",
+        "just wanted to check",
+    ]
+    if any(marker in normalized_lower for marker in long_sales_markers):
+        return fallback_opening_line
+
+    return normalized_opening_line
 
 
 @app.get("/ppm/health")
@@ -1589,6 +1690,71 @@ async def exotel_media(ws: WebSocket):
                     "bas ek quick check karna tha — aapka insurance recently review hua hai kya?"
                 )
 
+            voice_opening_package = ppm_build_voice_opening_package_local(
+                phone_number=conn_caller_number or "",
+                lead_name="",
+                industry="insurance",
+                product_type="insurance",
+                journey_stage="cold",
+            )
+
+            ppm_opening_line_before_local_normalization = ppm_opening_line
+            ppm_opening_line = ppm_normalize_voice_opening_line_local(
+                ppm_opening_line,
+                voice_opening_package,
+            )
+
+            ppm_followup_identity = (voice_opening_package or {}).get(
+                "followup_identity",
+                "Main Shashinath bol raha hoon, financial planning side se.",
+            )
+            ppm_followup_context = (voice_opening_package or {}).get(
+                "followup_context",
+                "Bas isliye pooch raha tha kyunki kaafi families ka cover adequate nahi hota.",
+            )
+            ppm_followup_question = (voice_opening_package or {}).get(
+                "followup_question",
+                "Aapne last time apna cover kab review kiya tha?",
+            )
+            ppm_whatsapp_transition = (voice_opening_package or {}).get(
+                "whatsapp_transition",
+                "Agar aap chaho toh main WhatsApp par ek short coverage check bhej deta hoon.",
+            )
+
+            save_ppm_debug_event(
+                call_id=conn_call_id or "",
+                stream_sid=stream_sid or "",
+                phone_number=conn_caller_number or "",
+                event_type="ppm_opening_line_normalized_local",
+                level="INFO",
+                source="ppm",
+                message="Local additive normalization applied to opening line",
+                payload={
+                    "opening_line_before_local_normalization": ppm_opening_line_before_local_normalization,
+                    "opening_line_after_local_normalization": ppm_opening_line,
+                    "voice_opening_package": voice_opening_package,
+                },
+            )
+
+            try:
+                await ppm_log_debug_event_remote({
+                    "client_id": "lic_shashinath",
+                    "channel": "voice",
+                    "call_id": conn_call_id or "",
+                    "stream_sid": stream_sid or "",
+                    "phone_number": conn_caller_number or "",
+                    "event_type": "ppm_opening_line_normalized_local",
+                    "level": "INFO",
+                    "message": "Local additive normalization applied to opening line",
+                    "payload": {
+                        "opening_line_before_local_normalization": ppm_opening_line_before_local_normalization,
+                        "opening_line_after_local_normalization": ppm_opening_line,
+                        "voice_opening_package": voice_opening_package,
+                    },
+                })
+            except Exception:
+                logger.exception("Remote PPM log-debug-event failed (ppm_opening_line_normalized_local)")
+
             save_ppm_debug_event(
                 call_id=conn_call_id or "",
                 stream_sid=stream_sid or "",
@@ -1610,6 +1776,65 @@ async def exotel_media(ws: WebSocket):
                 CALL_TRANSCRIPTS[stream_sid]["ppm_decision_id"] = (ppm_candidate or {}).get("decision_id")
                 CALL_TRANSCRIPTS[stream_sid]["ppm_strategy_key"] = (ppm_candidate or {}).get("strategy_key", "unknown")
                 CALL_TRANSCRIPTS[stream_sid]["ppm_source"] = (ppm_candidate or {}).get("source", "")
+
+                CALL_TRANSCRIPTS[stream_sid]["ppm_opening_line"] = ppm_opening_line
+                CALL_TRANSCRIPTS[stream_sid]["ppm_followup_identity"] = ppm_followup_identity
+                CALL_TRANSCRIPTS[stream_sid]["ppm_followup_context"] = ppm_followup_context
+                CALL_TRANSCRIPTS[stream_sid]["ppm_followup_question"] = ppm_followup_question
+                CALL_TRANSCRIPTS[stream_sid]["ppm_whatsapp_transition"] = ppm_whatsapp_transition
+
+
+            instructions_text = instructions_text + (
+                "\n\n"
+                "LOCAL ADDITIVE OPENING RULES:\n"
+                f"- Preferred opener for this call: '{ppm_opening_line}'\n"
+                f"- If the customer responds, identity line can be: '{ppm_followup_identity}'\n"
+                f"- Then use short context line: '{ppm_followup_context}'\n"
+                f"- Then use one follow-up question: '{ppm_followup_question}'\n"
+                f"- If customer is busy, use WhatsApp transition: '{ppm_whatsapp_transition}'\n"
+                "- Do not give long statistic-led monologues in the opening turn.\n"
+                "- Keep the opener authority-based, human, and short."
+            )
+
+            await send_openai({"type": "session.update", "session": {"instructions": instructions_text}})
+
+            save_ppm_debug_event(
+                call_id=conn_call_id or "",
+                stream_sid=stream_sid or "",
+                phone_number=conn_caller_number or "",
+                event_type="openai_session_update_opening_rules_added",
+                level="INFO",
+                source="voicebot",
+                message="Additional opening rules appended via additive session.update",
+                payload={
+                    "ppm_opening_line": ppm_opening_line,
+                    "ppm_followup_identity": ppm_followup_identity,
+                    "ppm_followup_context": ppm_followup_context,
+                    "ppm_followup_question": ppm_followup_question,
+                    "ppm_whatsapp_transition": ppm_whatsapp_transition,
+                },
+            )
+
+            try:
+                await ppm_log_debug_event_remote({
+                    "client_id": "lic_shashinath",
+                    "channel": "voice",
+                    "call_id": conn_call_id or "",
+                    "stream_sid": stream_sid or "",
+                    "phone_number": conn_caller_number or "",
+                    "event_type": "openai_session_update_opening_rules_added",
+                    "level": "INFO",
+                    "message": "Additional opening rules appended via additive session.update",
+                    "payload": {
+                        "ppm_opening_line": ppm_opening_line,
+                        "ppm_followup_identity": ppm_followup_identity,
+                        "ppm_followup_context": ppm_followup_context,
+                        "ppm_followup_question": ppm_followup_question,
+                        "ppm_whatsapp_transition": ppm_whatsapp_transition,
+                    },
+                })
+            except Exception:
+                logger.exception("Remote PPM log-debug-event failed (openai_session_update_opening_rules_added)")
 
             # Ask the model to start the first greeting turn
             await send_openai(
