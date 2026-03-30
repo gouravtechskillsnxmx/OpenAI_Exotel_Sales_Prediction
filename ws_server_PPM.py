@@ -72,6 +72,48 @@ except ModuleNotFoundError:
     save_ppm_debug_event = None
     get_debug_events = None
 
+# Additive safety fallbacks so optional PPM storage/logging never crashes live call flow.
+# This preserves existing variable names and only replaces missing / non-callable imports with no-op functions.
+try:
+    _ppm_init_db_callable = callable(init_ppm_db)
+except Exception:
+    _ppm_init_db_callable = False
+if not _ppm_init_db_callable:
+    def init_ppm_db(*args, **kwargs):
+        return None
+
+try:
+    _ppm_save_decision_callable = callable(save_ppm_decision)
+except Exception:
+    _ppm_save_decision_callable = False
+if not _ppm_save_decision_callable:
+    def save_ppm_decision(*args, **kwargs):
+        return None
+
+try:
+    _ppm_save_outcome_callable = callable(save_ppm_outcome)
+except Exception:
+    _ppm_save_outcome_callable = False
+if not _ppm_save_outcome_callable:
+    def save_ppm_outcome(*args, **kwargs):
+        return None
+
+try:
+    _ppm_save_debug_event_callable = callable(save_ppm_debug_event)
+except Exception:
+    _ppm_save_debug_event_callable = False
+if not _ppm_save_debug_event_callable:
+    def save_ppm_debug_event(*args, **kwargs):
+        return None
+
+try:
+    _ppm_get_debug_events_callable = callable(get_debug_events)
+except Exception:
+    _ppm_get_debug_events_callable = False
+if not _ppm_get_debug_events_callable:
+    def get_debug_events(*args, **kwargs):
+        return []
+
 
 
 # ---------------------------------------------------------
