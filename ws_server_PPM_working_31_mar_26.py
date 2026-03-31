@@ -748,17 +748,6 @@ HTML_PAGE = """
     </div>
 
     <div class="section">
-      <h2>Bulk Outbound Call (Sequential)</h2>
-      <form id="bulk-call-form" enctype="multipart/form-data">
-        <label for="bulk-file-input">Upload Excel (.xlsx/.xls). First column must contain callee numbers.</label>
-        <input id="bulk-file-input" type="file" accept=".xlsx,.xls" />
-        <br />
-        <button id="bulk-call-button" type="submit">Start Bulk Sequential Call</button>
-      </form>
-      <div id="bulk-call-result"></div>
-    </div>
-
-    <div class="section">
         <h2>Call Logs (Last 50)</h2>
         <button id="refresh-logs">Refresh Logs</button>
         <button id="download-ranked">Download Ranked Leads CSV</button>
@@ -814,38 +803,6 @@ HTML_PAGE = """
           });
           const data = await resp.json();
           resultDiv.textContent = JSON.stringify(data, null, 2);
-        } catch (e) {
-          resultDiv.textContent = "Error: " + e;
-        } finally {
-          btn.disabled = false;
-        }
-      }
-
-      async function triggerBulkCall(evt) {
-        evt.preventDefault();
-        const fileInput = document.getElementById("bulk-file-input");
-        const btn = document.getElementById("bulk-call-button");
-        const resultDiv = document.getElementById("bulk-call-result");
-
-        if (!fileInput.files || !fileInput.files[0]) {
-          resultDiv.textContent = "Please choose an Excel file.";
-          return;
-        }
-
-        const formData = new FormData();
-        formData.append("file", fileInput.files[0]);
-
-        btn.disabled = true;
-        resultDiv.textContent = "Starting bulk sequential call...";
-
-        try {
-          const resp = await fetch("/bulk-call-excel-sequential", {
-            method: "POST",
-            body: formData,
-          });
-          const data = await resp.json();
-          resultDiv.textContent = JSON.stringify(data, null, 2);
-          await loadCallLogs();
         } catch (e) {
           resultDiv.textContent = "Error: " + e;
         } finally {
@@ -911,9 +868,6 @@ HTML_PAGE = """
 
       document.getElementById("single-call-form")
         .addEventListener("submit", triggerSingleCall);
-
-      document.getElementById("bulk-call-form")
-        .addEventListener("submit", triggerBulkCall);
 
       document.getElementById("refresh-logs")
         .addEventListener("click", loadCallLogs);
@@ -2608,188 +2562,6 @@ async def exotel_status(request: Request):
     form = await request.form()
     logger.info("Exotel status callback: %s", dict(form))
     return JSONResponse({"status": "ok"})
-
-
-# ---------------------------------------------------------
-# NEW ADDITIVE: Direct Exotel sequential bulk calling from uploaded Excel
-# ---------------------------------------------------------
-
-def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
-    """
-    Additive bulk-call helper.
-    Uses the Exotel pattern shared by the user, but reads credentials/config from env:
-      - EXO_API_KEY
-      - EXO_API_TOKEN
-      - EXO_CALLER_ID
-      - EXOTEL_FLOW_URL or EXO_FLOW_ID
-    Only the callee number changes per row.
-    """
-    exo_api_key = (os.getenv("EXO_API_KEY", "") or "").strip()
-    exo_api_token = (os.getenv("EXO_API_TOKEN", "") or "").strip()
-    exo_caller_id = (os.getenv("EXO_CALLER_ID", "") or "").strip()
-    exo_flow_url = (os.getenv("EXOTEL_FLOW_URL", "") or "").strip()
-    exo_flow_id = (os.getenv("EXO_FLOW_ID", "") or "").strip()
-
-    if not exo_flow_url and exo_api_key and exo_flow_id:
-        exo_flow_url = f"http://my.exotel.com/{exo_api_key}/exoml/start_voice/{exo_flow_id}"
-
-    if not exo_api_key or not exo_api_token or not exo_caller_id or not exo_flow_url:
-        logger.error(
-            "Bulk Exotel env missing (EXO_API_KEY / EXO_API_TOKEN / EXO_CALLER_ID / EXOTEL_FLOW_URL or EXO_FLOW_ID)."
-        )
-        return {
-            "error": (
-                "Bulk Exotel env missing. Required: EXO_API_KEY, EXO_API_TOKEN, "
-                "EXO_CALLER_ID, and EXOTEL_FLOW_URL or EXO_FLOW_ID."
-            )
-        }
-
-    exotel_url = (
-        f"https://{exo_api_key}:{exo_api_token}"
-        f"@api.exotel.com/v1/Accounts/{exo_api_key}/Calls/connect.json"
-    )
-    payload = {
-        "From": to_number,
-        "CallerId": exo_caller_id,
-        "Url": exo_flow_url,
-    }
-
-    logger.info("Bulk Exotel outbound call URL: %s", exotel_url)
-    logger.info("Bulk Exotel outbound call payload: %s", payload)
-
-    try:
-        import requests
-        resp = requests.post(
-            exotel_url,
-            data=payload,
-            headers={"accept": "application/json"},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "")
-        if "application/json" in content_type.lower():
-            return resp.json()
-        return {"raw": resp.text}
-    except Exception as e:
-        logger.exception("Error placing bulk Exotel outbound call: %s", e)
-        return {"error": str(e)}
-
-
-@app.post("/bulk-call-excel-sequential")
-async def bulk_call_excel_sequential(request: Request):
-    """
-    Additive bulk calling endpoint.
-    Rules:
-    1. First column of Excel is treated as callee number.
-    2. Calls are triggered sequentially.
-    3. Delay between two calls is minimum BULK_CALL_DELAY_SEC env variable.
-    4. Existing code paths remain untouched.
-    """
-    try:
-        form = await request.form()
-    except Exception as e:
-        return JSONResponse({"error": f"Failed reading form-data: {e}"}, status_code=400)
-
-    file = form.get("file")
-    if file is None:
-        return JSONResponse({"error": "Please upload an Excel file in form field 'file'."}, status_code=400)
-
-    filename = (getattr(file, "filename", "") or "").lower()
-    if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
-        return JSONResponse({"error": "Please upload an Excel file (.xlsx or .xls)."}, status_code=400)
-
-    content = await file.read()
-    if not content:
-        return JSONResponse({"error": "Uploaded file is empty."}, status_code=400)
-
-    import io as _io
-    import uuid as _uuid
-    import re as _re
-    import pandas as _pd
-    import asyncio as _asyncio
-
-    try:
-        # First column is callee number. Read with no header so row-1 is not lost.
-        df = _pd.read_excel(_io.BytesIO(content), header=None)
-    except Exception as e:
-        logger.exception("Failed reading bulk sequential Excel")
-        return JSONResponse({"error": f"Failed to read Excel: {e}"}, status_code=400)
-
-    if df.empty:
-        return JSONResponse({"error": "Excel has no rows."}, status_code=400)
-
-    raw_numbers = df.iloc[:, 0].tolist()
-
-    def _clean_bulk_number(x: object) -> str:
-        s = "" if x is None else str(x).strip()
-        if not s:
-            return ""
-        # skip obvious headers like 'phone'
-        if s.lower() in {"phone", "mobile", "number", "contact", "callee", "callee_number"}:
-            return ""
-        # remove everything except digits and +
-        s = _re.sub(r"[^\d+]", "", s)
-        digits = _re.sub(r"\D", "", s)
-        if not digits:
-            return ""
-        if len(digits) == 10:
-            return "0" + digits
-        if len(digits) == 12 and digits.startswith("91"):
-            return "0" + digits[2:]
-        if len(digits) == 11 and digits.startswith("0"):
-            return digits
-        return digits
-
-    numbers = []
-    seen = set()
-    for item in raw_numbers:
-        num = _clean_bulk_number(item)
-        if num and num not in seen:
-            seen.add(num)
-            numbers.append(num)
-
-    if not numbers:
-        return JSONResponse({"error": "No valid callee numbers found in the first column."}, status_code=400)
-
-    delay_sec = float(os.getenv("BULK_CALL_DELAY_SEC", "2.0"))
-    batch_id = str(_uuid.uuid4())
-    results = []
-    called_ok = 0
-    called_failed = 0
-
-    async with BULK_CALL_LOCK:
-        for idx, number in enumerate(numbers, start=1):
-            result = await _asyncio.to_thread(exotel_outbound_call_bulk_direct, number)
-            if isinstance(result, dict) and result.get("error"):
-                called_failed += 1
-                results.append({
-                    "row_number": idx,
-                    "phone": number,
-                    "status": "error",
-                    "error": result.get("error"),
-                })
-            else:
-                called_ok += 1
-                results.append({
-                    "row_number": idx,
-                    "phone": number,
-                    "status": "ok",
-                    "result": result,
-                })
-
-            if idx < len(numbers) and delay_sec > 0:
-                await _asyncio.sleep(delay_sec)
-
-    return {
-        "status": "ok",
-        "bulk_batch_id": batch_id,
-        "phone_column_used": 0,
-        "total_numbers": len(numbers),
-        "called_ok": called_ok,
-        "called_failed": called_failed,
-        "delay_sec": delay_sec,
-        "results": results,
-    }
 
 
 # ---------------------------------------------------------
