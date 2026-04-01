@@ -164,7 +164,12 @@ LIC_CRM_MCP_BASE_URL = os.getenv("LIC_CRM_MCP_BASE_URL", "").rstrip("/")
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()  # no protocol
 
 DB_PATH = os.getenv("DB_PATH", "/tmp/call_logs.db")
-
+# =========================
+# ADDITIVE VOICE CONTROL
+# =========================
+VOICE_AUTO_SPEAK_DELAY_MS = int(os.getenv("VOICE_AUTO_SPEAK_DELAY_MS", "800"))
+VOICE_REENGAGE_DELAY_MS = int(os.getenv("VOICE_REENGAGE_DELAY_MS", "2500"))
+VOICE_ENABLE_START_NUDGE = os.getenv("VOICE_ENABLE_START_NUDGE", "1") == "1"
 
 def public_url(path: str) -> str:
     host = PUBLIC_BASE_URL
@@ -591,6 +596,7 @@ CALL_TRANSCRIPTS: Dict[str, Dict[str, Any]] = {}
 
 # Prevent multiple bulk batches from running concurrently
 BULK_CALL_LOCK = asyncio.Lock()
+BULK_CALL_PROGRESS: Dict[str, Dict[str, Any]] = {}
 
 @app.post("/import_call_logs")
 async def import_call_logs(request: Request):
@@ -756,6 +762,16 @@ HTML_PAGE = """
         <button id="bulk-call-button" type="submit">Start Bulk Sequential Call</button>
       </form>
       <div id="bulk-call-result"></div>
+      <div id="bulk-progress-box" style="margin-top:12px; display:none; border:1px solid #ddd; padding:12px; border-radius:8px;">
+        <div><strong>Batch ID:</strong> <span id="bulk-progress-batch-id"></span></div>
+        <div><strong>Status:</strong> <span id="bulk-progress-status">idle</span></div>
+        <div><strong>Total:</strong> <span id="bulk-progress-total">0</span></div>
+        <div><strong>Running:</strong> <span id="bulk-progress-running">0</span></div>
+        <div><strong>Completed:</strong> <span id="bulk-progress-completed">0</span></div>
+        <div><strong>Failed:</strong> <span id="bulk-progress-failed">0</span></div>
+        <div><strong>Current Number:</strong> <span id="bulk-progress-current-number"></span></div>
+        <div><strong>Last Message:</strong> <span id="bulk-progress-message"></span></div>
+      </div>
     </div>
 
     <div class="section">
@@ -821,6 +837,39 @@ HTML_PAGE = """
         }
       }
 
+      let bulkProgressTimer = null;
+
+      function renderBulkProgress(data) {
+        const box = document.getElementById("bulk-progress-box");
+        box.style.display = "block";
+        document.getElementById("bulk-progress-batch-id").textContent = data.batch_id || "";
+        document.getElementById("bulk-progress-status").textContent = data.status || "";
+        document.getElementById("bulk-progress-total").textContent = data.total_numbers || 0;
+        document.getElementById("bulk-progress-running").textContent = data.running_count || 0;
+        document.getElementById("bulk-progress-completed").textContent = data.completed_count || 0;
+        document.getElementById("bulk-progress-failed").textContent = data.failed_count || 0;
+        document.getElementById("bulk-progress-current-number").textContent = data.current_number || "";
+        document.getElementById("bulk-progress-message").textContent = data.message || "";
+      }
+
+      async function pollBulkProgress(batchId) {
+        try {
+          const resp = await fetch(`/bulk-call-progress/${batchId}`);
+          const data = await resp.json();
+          renderBulkProgress(data);
+
+          if (data.status === "completed" || data.status === "completed_with_errors" || data.status === "failed") {
+            if (bulkProgressTimer) {
+              clearInterval(bulkProgressTimer);
+              bulkProgressTimer = null;
+            }
+            await loadCallLogs();
+          }
+        } catch (e) {
+          console.error("Bulk progress polling error:", e);
+        }
+      }
+
       async function triggerBulkCall(evt) {
         evt.preventDefault();
         const fileInput = document.getElementById("bulk-file-input");
@@ -839,13 +888,31 @@ HTML_PAGE = """
         resultDiv.textContent = "Starting bulk sequential call...";
 
         try {
-          const resp = await fetch("/bulk-call-excel-sequential", {
+          const resp = await fetch("/bulk-call-excel-sequential-start", {
             method: "POST",
             body: formData,
           });
           const data = await resp.json();
           resultDiv.textContent = JSON.stringify(data, null, 2);
-          await loadCallLogs();
+
+          if (data.batch_id) {
+            renderBulkProgress({
+              batch_id: data.batch_id,
+              status: "queued",
+              total_numbers: data.total_numbers || 0,
+              running_count: 0,
+              completed_count: 0,
+              failed_count: 0,
+              current_number: "",
+              message: "Batch created. Starting shortly...",
+            });
+
+            if (bulkProgressTimer) {
+              clearInterval(bulkProgressTimer);
+            }
+            bulkProgressTimer = setInterval(() => pollBulkProgress(data.batch_id), 2000);
+            await pollBulkProgress(data.batch_id);
+          }
         } catch (e) {
           resultDiv.textContent = "Error: " + e;
         } finally {
@@ -1468,6 +1535,12 @@ async def exotel_media(ws: WebSocket):
     call_start_ts: Optional[float] = None
     had_audio: bool = False
     first_media_logged: bool = False
+    # =========================
+# ADDITIVE VOICE STATE CONTROL
+# =========================
+    auto_speak_task: Optional[asyncio.Task] = None
+    reengage_task: Optional[asyncio.Task] = None
+    caller_spoke_flag: bool = False
     # NEW: transcript capture buffers (Option B)
     ai_transcript_texts: list[str] = []
     summary_saved: bool = False  # tracks if model already saved summary
@@ -1944,6 +2017,47 @@ async def exotel_media(ws: WebSocket):
                       },
                 }
             )
+            # =========================
+                # ADDITIVE AUTO-SPEAK + RE-ENGAGE (DO NOT MODIFY EXISTING FLOW)
+            # =========================
+
+            if VOICE_ENABLE_START_NUDGE:
+
+                async def _auto_speak_nudge():
+                    await asyncio.sleep(VOICE_AUTO_SPEAK_DELAY_MS / 1000.0)
+
+                    if not caller_spoke_flag:
+                        try:
+                            await send_openai({
+                                "type": "response.create",
+                                "response": {
+                                    "instructions": "Continue speaking the opening line naturally if user is silent.",
+                                    "modalities": ["text", "audio"],
+                                },
+                            })
+                        except Exception:
+                            logger.exception("Auto speak nudge failed")
+
+                    async def _reengage_nudge():
+                        await asyncio.sleep(VOICE_REENGAGE_DELAY_MS / 1000.0)
+
+                        if not caller_spoke_flag:
+                            try:
+                                await send_openai({
+                                    "type": "response.create",
+                                    "response": {
+                                        "instructions": (
+                                            "User seems silent. Say: "
+                                            "'Aap sun pa rahe hain? Ek quick point bolke nikal jaunga.'"
+                                        ),
+                                        "modalities": ["text", "audio"],
+                                    },
+                                })
+                            except Exception:
+                                logger.exception("Re-engage nudge failed")
+
+                            auto_speak_task = asyncio.create_task(_auto_speak_nudge())
+                            reengage_task = asyncio.create_task(_reengage_nudge())
 
             async def pump():
                 """
@@ -2340,6 +2454,14 @@ async def exotel_media(ws: WebSocket):
                     
                     had_audio = True
 
+                    caller_spoke_flag = True
+
+                    # cancel nudges once user speaks
+                    if auto_speak_task:
+                        auto_speak_task.cancel()
+                    if reengage_task:
+                        reengage_task.cancel()
+
                     pcm24 = upsample_8k_to_24k_pcm16(pcm8)
                     audio_b64 = base64.b64encode(pcm24).decode("ascii")
                     await send_openai(
@@ -2593,8 +2715,13 @@ async def exotel_media(ws: WebSocket):
             await openai_ws.close()
         if openai_session:
             await openai_session.close()
+        # cleanup additive tasks
+        if auto_speak_task:
+            auto_speak_task.cancel()
+        if reengage_task:
+            reengage_task.cancel()
         await ws.close()
-
+        
 
 # ---------------------------------------------------------
 # Exotel status callback (optional)
@@ -2629,7 +2756,6 @@ def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
     exo_caller_id = (os.getenv("EXO_CALLER_ID", "") or "").strip()
     exo_flow_url = (os.getenv("EXOTEL_FLOW_URL", "") or "").strip()
     exo_flow_id = (os.getenv("EXO_FLOW_ID", "") or "").strip()
-    exo_sid = (os.getenv("EXO_SID", "") or "").strip()
 
     if not exo_flow_url and exo_api_key and exo_flow_id:
         exo_flow_url = f"http://my.exotel.com/{exo_api_key}/exoml/start_voice/{exo_flow_id}"
@@ -2647,7 +2773,7 @@ def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
 
     exotel_url = (
         f"https://{exo_api_key}:{exo_api_token}"
-        f"@api.exotel.com/v1/Accounts/{exo_sid}/Calls/connect.json"
+        f"@api.exotel.com/v1/Accounts/{exo_api_key}/Calls/connect.json"
     )
     payload = {
         "From": to_number,
@@ -2793,6 +2919,185 @@ async def bulk_call_excel_sequential(request: Request):
     }
 
 
+def _build_bulk_progress_snapshot(batch_id: str) -> Dict[str, Any]:
+    progress = BULK_CALL_PROGRESS.get(batch_id) or {}
+    return {
+        "batch_id": batch_id,
+        "status": progress.get("status", "unknown"),
+        "total_numbers": progress.get("total_numbers", 0),
+        "running_count": progress.get("running_count", 0),
+        "completed_count": progress.get("completed_count", 0),
+        "failed_count": progress.get("failed_count", 0),
+        "current_index": progress.get("current_index", 0),
+        "current_number": progress.get("current_number", ""),
+        "delay_sec": progress.get("delay_sec", 0),
+        "message": progress.get("message", ""),
+        "results": progress.get("results", []),
+    }
+
+
+async def _run_bulk_call_excel_sequential_batch(
+    *,
+    batch_id: str,
+    numbers: List[str],
+    delay_sec: float,
+) -> None:
+    progress = BULK_CALL_PROGRESS.get(batch_id)
+    if progress is None:
+        return
+
+    progress["status"] = "running"
+    progress["message"] = "Bulk batch is running."
+
+    async with BULK_CALL_LOCK:
+        total = len(numbers)
+        for idx, number in enumerate(numbers, start=1):
+            progress["current_index"] = idx
+            progress["current_number"] = number
+            progress["running_count"] = 1
+            progress["message"] = f"Calling {number} ({idx}/{total})"
+
+            result = await asyncio.to_thread(exotel_outbound_call_bulk_direct, number)
+            if isinstance(result, dict) and result.get("error"):
+                progress["failed_count"] += 1
+                progress["results"].append({
+                    "row_number": idx,
+                    "phone": number,
+                    "status": "error",
+                    "error": result.get("error"),
+                })
+            else:
+                progress["completed_count"] += 1
+                progress["results"].append({
+                    "row_number": idx,
+                    "phone": number,
+                    "status": "ok",
+                    "result": result,
+                })
+
+            progress["running_count"] = 0
+
+            if idx < total and delay_sec > 0:
+                progress["message"] = f"Waiting {delay_sec} seconds before next call."
+                await asyncio.sleep(delay_sec)
+
+    progress["current_number"] = ""
+    progress["running_count"] = 0
+    progress["status"] = "completed_with_errors" if progress["failed_count"] > 0 else "completed"
+    progress["message"] = "Bulk batch finished."
+
+
+@app.get("/bulk-call-progress/{batch_id}")
+async def bulk_call_progress(batch_id: str):
+    progress = BULK_CALL_PROGRESS.get(batch_id)
+    if not progress:
+        return JSONResponse({"error": "batch_id not found"}, status_code=404)
+    return _build_bulk_progress_snapshot(batch_id)
+
+
+@app.post("/bulk-call-excel-sequential-start")
+async def bulk_call_excel_sequential_start(request: Request):
+    """
+    Starts the sequential bulk batch in the background and returns immediately
+    so UI can poll progress in real time.
+    Existing call logic remains untouched.
+    """
+    try:
+        form = await request.form()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed reading form-data: {e}"}, status_code=400)
+
+    file = form.get("file")
+    if file is None:
+        return JSONResponse({"error": "Please upload an Excel file in form field 'file'."}, status_code=400)
+
+    filename = (getattr(file, "filename", "") or "").lower()
+    if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
+        return JSONResponse({"error": "Please upload an Excel file (.xlsx or .xls)."}, status_code=400)
+
+    content = await file.read()
+    if not content:
+        return JSONResponse({"error": "Uploaded file is empty."}, status_code=400)
+
+    import io as _io
+    import uuid as _uuid
+    import re as _re
+    import pandas as _pd
+
+    try:
+        df = _pd.read_excel(_io.BytesIO(content), header=None)
+    except Exception as e:
+        logger.exception("Failed reading bulk sequential Excel for background batch")
+        return JSONResponse({"error": f"Failed to read Excel: {e}"}, status_code=400)
+
+    if df.empty:
+        return JSONResponse({"error": "Excel has no rows."}, status_code=400)
+
+    raw_numbers = df.iloc[:, 0].tolist()
+
+    def _clean_bulk_number_start(x: object) -> str:
+        s = "" if x is None else str(x).strip()
+        if not s:
+            return ""
+        if s.lower() in {"phone", "mobile", "number", "contact", "callee", "callee_number"}:
+            return ""
+        s = _re.sub(r"[^\d+]", "", s)
+        digits = _re.sub(r"\D", "", s)
+        if not digits:
+            return ""
+        if len(digits) == 10:
+            return "0" + digits
+        if len(digits) == 12 and digits.startswith("91"):
+            return "0" + digits[2:]
+        if len(digits) == 11 and digits.startswith("0"):
+            return digits
+        return digits
+
+    numbers = []
+    seen = set()
+    for item in raw_numbers:
+        num = _clean_bulk_number_start(item)
+        if num and num not in seen:
+            seen.add(num)
+            numbers.append(num)
+
+    if not numbers:
+        return JSONResponse({"error": "No valid callee numbers found in the first column."}, status_code=400)
+
+    delay_sec = float(os.getenv("BULK_CALL_DELAY_SEC", "2.0"))
+    batch_id = str(_uuid.uuid4())
+
+    BULK_CALL_PROGRESS[batch_id] = {
+        "status": "queued",
+        "total_numbers": len(numbers),
+        "running_count": 0,
+        "completed_count": 0,
+        "failed_count": 0,
+        "current_index": 0,
+        "current_number": "",
+        "delay_sec": delay_sec,
+        "message": "Batch queued.",
+        "results": [],
+    }
+
+    asyncio.create_task(
+        _run_bulk_call_excel_sequential_batch(
+            batch_id=batch_id,
+            numbers=numbers,
+            delay_sec=delay_sec,
+        )
+    )
+
+    return {
+        "status": "ok",
+        "batch_id": batch_id,
+        "total_numbers": len(numbers),
+        "delay_sec": delay_sec,
+        "message": "Bulk batch started in background.",
+    }
+
+
+
 # ---------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------
@@ -2901,4 +3206,200 @@ def _rank_customers(df: pd.DataFrame, top_k: int) -> pd.DataFrame:
     return best_rows.head(top_k).copy()
 
 
+# ---------------------------------------------------------
+# NEW: Bulk calling from uploaded Excel
+# ---------------------------------------------------------
 
+@app.post("/bulk-call-excel")
+async def bulk_call_excel(request: Request):
+    """
+    Bulk call from uploaded Excel (.xlsx/.xls).
+
+    SAFETY / NO-CORRUPTION GUARDBAND:
+    - If Exotel creds are missing (EXO_SID / EXO_API_TOKEN / EXO_CALLER_ID), we return 400 and DO NOT write to DB.
+    - By default we DO NOT insert any "bulk_triggered" rows into call_logs.
+      Set env BULK_CALL_WRITE_AUDIT=1 if you explicitly want audit rows.
+    - We treat any {"error": "..."} returned by exotel_outbound_call as a failed call trigger.
+      (So you don't get fake called_ok counts.)
+    """
+    # Parse multipart form and extract `file`
+    try:
+        form = await request.form()
+    except Exception as e:
+        return JSONResponse({"error": f"Failed reading form-data: {e}"}, status_code=400)
+
+    file = form.get("file")
+
+    # Validate Exotel env (ONLY these names matter)
+    if not EXO_SID or not EXO_API_TOKEN or not EXO_CALLER_ID:
+        return JSONResponse(
+            {
+                "error": "Exotel env missing. Required: EXO_SID, EXO_API_TOKEN, EXO_CALLER_ID (and optionally EXO_FLOW_ID / EXOTEL_FLOW_URL)."
+            },
+            status_code=400,
+        )
+
+    # Local imports to avoid touching existing global imports
+    import pandas as _pd
+    import io as _io
+    import asyncio as _asyncio
+    import re as _re
+    import uuid as _uuid
+
+    filename = (getattr(file, "filename", "") or "").lower()
+    if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
+        return JSONResponse({"error": "Please upload an Excel file (.xlsx or .xls)."}, status_code=400)
+
+    content = await file.read()
+    if not content:
+        return JSONResponse({"error": "Uploaded file is empty."}, status_code=400)
+
+    try:
+        df = _pd.read_excel(_io.BytesIO(content))
+    except Exception as e:
+        logger.exception("Failed reading Excel")
+        return JSONResponse({"error": f"Failed to read Excel: {e}"}, status_code=400)
+
+    if df.empty:
+        return JSONResponse({"error": "Excel has no rows."}, status_code=400)
+
+    # Pick phone/number column
+    cols = [str(c) for c in df.columns]
+    phone_col = None
+    for c in cols:
+        cl = c.strip().lower()
+        if any(k in cl for k in ["phone", "mobile", "number", "contact"]):
+            phone_col = c
+            break
+    if phone_col is None:
+        phone_col = cols[0]
+
+    raw_numbers = df[phone_col].tolist()
+
+    def _clean_number(x: object) -> str:
+        s = "" if x is None else str(x)
+        s = s.strip()
+        if not s:
+            return ""
+        # keep + and digits; drop everything else
+        s = _re.sub(r"[^\d+]", "", s)
+        # Excel floats / scientific notation edge case
+        if "e" in s.lower():
+            try:
+                s2 = str(int(float(str(x))))
+                s2 = _re.sub(r"[^\d+]", "", s2)
+                s = s2
+            except Exception:
+                pass
+        # normalize +91XXXXXXXXXX or 91XXXXXXXXXX or XXXXXXXXXX to 91XXXXXXXXXX
+        digits = _re.sub(r"\D", "", s)
+        if len(digits) == 10:
+            digits = "91" + digits
+        elif len(digits) == 12 and digits.startswith("91"):
+            pass
+        else:
+            # leave as-is; exotel may accept other formats; your validation can be stricter later
+            return digits
+        return digits
+
+    numbers = []
+    for rn in raw_numbers:
+        n = _clean_number(rn)
+        if n:
+            numbers.append(n)
+
+    if not numbers:
+        return JSONResponse({"error": f"No phone numbers found in column '{phone_col}'."}, status_code=400)
+
+    # De-dup while preserving order
+    seen = set()
+    deduped = []
+    for n in numbers:
+        if n not in seen:
+            seen.add(n)
+            deduped.append(n)
+    numbers = deduped
+
+    delay_sec = float(os.getenv("BULK_CALL_DELAY_SEC", "2.0"))
+    write_audit = os.getenv("BULK_CALL_WRITE_AUDIT", "0").strip() == "1"
+    batch_id = str(_uuid.uuid4())
+
+    results = []
+    called_ok = 0
+    called_failed = 0
+
+    async with BULK_CALL_LOCK:
+        for n in numbers:
+            # Trigger Exotel call (run sync requests.post in a thread to avoid blocking the event loop)
+            try:
+                r = await _asyncio.to_thread(exotel_outbound_call, n)
+                # Treat {"error": "..."} as failure
+                if isinstance(r, dict) and r.get("error"):
+                    called_failed += 1
+                    results.append({"phone": n, "status": "error", "error": r.get("error"), "batch_id": batch_id})
+                    if write_audit:
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cur = conn.cursor()
+                            cur.execute(
+                                """
+                                INSERT INTO call_logs (call_id, phone_number, status, summary)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                ("", n, "bulk_failed", f"bulk_batch_id={batch_id}; error={r.get('error')}"),
+                            )
+                            conn.commit()
+                            conn.close()
+                        except Exception:
+                            logger.exception("Failed inserting bulk_failed audit row for %s", n)
+                else:
+                    called_ok += 1
+                    results.append({"phone": n, "status": "ok", "result": r, "batch_id": batch_id})
+                    if write_audit:
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cur = conn.cursor()
+                            cur.execute(
+                                """
+                                INSERT INTO call_logs (call_id, phone_number, status, summary)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                ("", n, "bulk_triggered", f"bulk_batch_id={batch_id}; bulk call triggered."),
+                            )
+                            conn.commit()
+                            conn.close()
+                        except Exception:
+                            logger.exception("Failed inserting bulk_triggered audit row for %s", n)
+            except Exception as e:
+                logger.exception("Bulk call failed for %s", n)
+                called_failed += 1
+                results.append({"phone": n, "status": "error", "error": str(e), "batch_id": batch_id})
+                if write_audit:
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        cur = conn.cursor()
+                        cur.execute(
+                            """
+                            INSERT INTO call_logs (call_id, phone_number, status, summary)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            ("", n, "bulk_failed", f"bulk_batch_id={batch_id}; exception={str(e)}"),
+                        )
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        logger.exception("Failed inserting bulk_failed audit row for %s", n)
+
+            if delay_sec > 0:
+                await _asyncio.sleep(delay_sec)
+    return {
+        "status": "ok",
+        "bulk_batch_id": batch_id,
+        "phone_column_used": phone_col,
+        "total_numbers": len(numbers),
+        "called_ok": called_ok,
+        "called_failed": called_failed,
+        "delay_sec": delay_sec,
+        "write_audit": write_audit,
+        "results": results,
+    }
