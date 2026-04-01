@@ -142,7 +142,7 @@ EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")
 EXOTEL_FLOW_URL = os.getenv("EXOTEL_FLOW_URL", "").strip()
 if not EXOTEL_FLOW_URL:
     if EXO_API_KEY  and EXO_FLOW_ID:
-        EXOTEL_FLOW_URL = f"http://my.exotel.com/{EXO_API_KEY}/exoml/start_voice/{EXO_FLOW_ID}"
+        EXOTEL_FLOW_URL = f"http://my.exotel.com/{EXO_SID}/exoml/start_voice/{EXO_FLOW_ID}"
     else:
         EXOTEL_FLOW_URL = "http://my.exotel.com/gouravnxmx1/exoml/start_voice/1077390"
 
@@ -2758,7 +2758,7 @@ def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
     exo_flow_id = (os.getenv("EXO_FLOW_ID", "") or "").strip()
 
     if not exo_flow_url and exo_api_key and exo_flow_id:
-        exo_flow_url = f"http://my.exotel.com/{exo_api_key}/exoml/start_voice/{exo_flow_id}"
+        exo_flow_url = f"http://my.exotel.com/{EXO_SID}/exoml/start_voice/{exo_flow_id}"
 
     if not exo_api_key or not exo_api_token or not exo_caller_id or not exo_flow_url:
         logger.error(
@@ -2773,7 +2773,7 @@ def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
 
     exotel_url = (
         f"https://{exo_api_key}:{exo_api_token}"
-        f"@api.exotel.com/v1/Accounts/{exo_api_key}/Calls/connect.json"
+        f"@api.exotel.com/v1/Accounts/{EXO_SID}/Calls/connect.json"
     )
     payload = {
         "From": to_number,
