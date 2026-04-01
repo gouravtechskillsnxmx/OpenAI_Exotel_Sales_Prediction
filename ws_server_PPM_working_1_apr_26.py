@@ -2957,7 +2957,6 @@ async def _run_bulk_call_excel_sequential_batch(
             progress["running_count"] = 1
             progress["message"] = f"Calling {number} ({idx}/{total})"
 
-            await kill_previous_bulk_call_if_running()
             result = await asyncio.to_thread(exotel_outbound_call_bulk_direct, number)
             if isinstance(result, dict) and result.get("error"):
                 progress["failed_count"] += 1
@@ -3404,57 +3403,3 @@ async def bulk_call_excel(request: Request):
         "write_audit": write_audit,
         "results": results,
     }
-
-
-# ===================== ADDITIVE BULK CALL CONTROL =====================
-
-import time
-
-ACTIVE_BULK_CALL = {
-    "call_id": "",
-    "phone_number": "",
-    "stream_sid": "",
-    "ws": None,
-    "openai_ws": None,
-    "started_at": 0.0,
-}
-
-ACTIVE_BULK_CALL_LOCK = asyncio.Lock()
-
-async def kill_previous_bulk_call_if_running():
-    async with ACTIVE_BULK_CALL_LOCK:
-        ws = ACTIVE_BULK_CALL.get("ws")
-        openai_ws = ACTIVE_BULK_CALL.get("openai_ws")
-
-        if not ws and not openai_ws:
-            return {"status": "no_active_call"}
-
-        try:
-            if openai_ws and not getattr(openai_ws, "closed", True):
-                await openai_ws.close()
-        except Exception as e:
-            print("Error closing openai_ws:", e)
-
-        try:
-            if ws:
-                await ws.close()
-        except Exception as e:
-            print("Error closing ws:", e)
-
-        info = {
-            "call_id": ACTIVE_BULK_CALL.get("call_id"),
-            "phone_number": ACTIVE_BULK_CALL.get("phone_number"),
-        }
-
-        ACTIVE_BULK_CALL.update({
-            "call_id": "",
-            "phone_number": "",
-            "stream_sid": "",
-            "ws": None,
-            "openai_ws": None,
-            "started_at": 0.0,
-        })
-
-        return {"status": "killed_previous_call", **info}
-
-# ===================== END ADDITIVE =====================
