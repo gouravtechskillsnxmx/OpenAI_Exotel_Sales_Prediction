@@ -2993,9 +2993,7 @@ async def _run_bulk_call_excel_sequential_batch(
             if idx < total and delay_sec > 0:
                 progress["message"] = f"Waiting {delay_sec} seconds before next call."
                 await asyncio.sleep(delay_sec)
-                kill_info = await kill_previous_bulk_call_and_wait_until_stopped()
-                print("CALL AUTO-KILLED:", kill_info)
-
+            
     progress["current_number"] = ""
     progress["running_count"] = 0
     progress["status"] = "completed_with_errors" if progress["failed_count"] > 0 else "completed"
@@ -3419,89 +3417,3 @@ async def bulk_call_excel(request: Request):
         "results": results,
     }
 
-
-# ===================== ADDITIVE BULK CALL CONTROL =====================
-
-import time
-
-ACTIVE_BULK_CALL = {
-    "call_id": "",
-    "phone_number": "",
-    "stream_sid": "",
-    "ws": None,
-    "openai_ws": None,
-    "started_at": 0.0,
-}
-
-ACTIVE_BULK_CALL_LOCK = asyncio.Lock()
-
-async def kill_previous_bulk_call_and_wait_until_stopped(
-    max_wait_sec: float = 30.0,
-    poll_interval_sec: float = 0.5,
-) -> Dict[str, Any]:
-    start_wait = time.time()
-
-    while True:
-        async with ACTIVE_BULK_CALL_LOCK:
-            active_ws = ACTIVE_BULK_CALL.get("ws")
-            active_openai_ws = ACTIVE_BULK_CALL.get("openai_ws")
-            active_call_id = ACTIVE_BULK_CALL.get("call_id") or ""
-            active_phone = ACTIVE_BULK_CALL.get("phone_number") or ""
-            active_stream_sid = ACTIVE_BULK_CALL.get("stream_sid") or ""
-
-        has_live_call = False
-
-        try:
-            if active_ws is not None:
-                has_live_call = True
-        except Exception:
-            pass
-
-        try:
-            if active_openai_ws is not None and not getattr(active_openai_ws, "closed", True):
-                has_live_call = True
-        except Exception:
-            pass
-
-        if not has_live_call:
-            return {"status": "no_active_call"}
-
-        logger.warning(
-            "Previous bulk call still active. Killing and waiting. call_id=%s phone=%s stream_sid=%s",
-            active_call_id,
-            active_phone,
-            active_stream_sid,
-        )
-
-        try:
-            if active_openai_ws is not None and not getattr(active_openai_ws, "closed", True):
-                await active_openai_ws.close()
-        except Exception:
-            logger.exception("Failed closing previous active bulk OpenAI WS")
-
-        try:
-            if active_ws is not None:
-                await active_ws.close()
-        except Exception:
-            logger.exception("Failed closing previous active bulk Exotel WS")
-
-        waited = time.time() - start_wait
-        if waited >= max_wait_sec:
-            async with ACTIVE_BULK_CALL_LOCK:
-                ACTIVE_BULK_CALL["call_id"] = ""
-                ACTIVE_BULK_CALL["phone_number"] = ""
-                ACTIVE_BULK_CALL["stream_sid"] = ""
-                ACTIVE_BULK_CALL["ws"] = None
-                ACTIVE_BULK_CALL["openai_ws"] = None
-                ACTIVE_BULK_CALL["started_at"] = 0.0
-
-            return {
-                "status": "force_cleared_after_timeout",
-                "call_id": active_call_id,
-                "phone_number": active_phone,
-                "stream_sid": active_stream_sid,
-                "waited_sec": waited,
-            }
-
-        await asyncio.sleep(poll_interval_sec)
-# ===================== END ADDITIVE =====================
