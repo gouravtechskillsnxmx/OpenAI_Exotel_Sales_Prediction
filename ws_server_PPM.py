@@ -2775,10 +2775,12 @@ def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
         f"https://{exo_api_key}:{exo_api_token}"
         f"@api.exotel.com/v1/Accounts/{EXO_SID}/Calls/connect.json"
     )
+    delay_sec = int(float(os.getenv("BULK_CALL_DELAY_SEC", "240")))
     payload = {
         "From": to_number,
         "CallerId": exo_caller_id,
         "Url": exo_flow_url,
+        "TimeLimit": str(delay_sec),
     }
 
     logger.info("Bulk Exotel outbound call URL: %s", exotel_url)
@@ -2957,7 +2959,7 @@ async def _run_bulk_call_excel_sequential_batch(
             progress["running_count"] = 1
             progress["message"] = f"Calling {number} ({idx}/{total})"
 
-            kill_info = await kill_previous_bulk_call_and_wait_until_stopped()
+            
             result = await asyncio.to_thread(exotel_outbound_call_bulk_direct, number)
             if isinstance(result, dict) and result.get("error"):
                 progress["failed_count"] += 1
@@ -2981,6 +2983,8 @@ async def _run_bulk_call_excel_sequential_batch(
             if idx < total and delay_sec > 0:
                 progress["message"] = f"Waiting {delay_sec} seconds before next call."
                 await asyncio.sleep(delay_sec)
+                kill_info = await kill_previous_bulk_call_and_wait_until_stopped()
+                print("CALL AUTO-KILLED:", kill_info)
 
     progress["current_number"] = ""
     progress["running_count"] = 0
