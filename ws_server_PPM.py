@@ -2743,44 +2743,41 @@ async def exotel_status(request: Request):
 
 def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
     """
-    Additive bulk-call helper.
-    Uses the Exotel pattern shared by the user, but reads credentials/config from env:
-      - EXO_API_KEY
-      - EXO_API_TOKEN
-      - EXO_CALLER_ID
-      - EXOTEL_FLOW_URL or EXO_FLOW_ID
-    Only the callee number changes per row.
+    Updated ONLY this function.
+    - Uses EXO_API_KEY, EXO_API_TOKEN, EXO_SID (UNCHANGED names)
+    - Uses region-aware host (api.in.exotel.com)
+    - Enforces TimeLimit = BULK_CALL_DELAY_SEC
     """
+
     exo_api_key = (os.getenv("EXO_API_KEY", "") or "").strip()
     exo_api_token = (os.getenv("EXO_API_TOKEN", "") or "").strip()
+    exo_sid = (os.getenv("EXO_SID", "") or "").strip()
     exo_caller_id = (os.getenv("EXO_CALLER_ID", "") or "").strip()
     exo_flow_url = (os.getenv("EXOTEL_FLOW_URL", "") or "").strip()
     exo_flow_id = (os.getenv("EXO_FLOW_ID", "") or "").strip()
 
-    if not exo_flow_url and exo_api_key and exo_flow_id:
-        exo_flow_url = f"http://my.exotel.com/{EXO_SID}/exoml/start_voice/{exo_flow_id}"
+    # Build flow URL if not present
+    if not exo_flow_url and exo_sid and exo_flow_id:
+        exo_flow_url = f"http://my.exotel.com/{exo_sid}/exoml/start_voice/{exo_flow_id}"
 
-    if not exo_api_key or not exo_api_token or not exo_caller_id or not exo_flow_url:
-        logger.error(
-            "Bulk Exotel env missing (EXO_API_KEY / EXO_API_TOKEN / EXO_CALLER_ID / EXOTEL_FLOW_URL or EXO_FLOW_ID)."
-        )
+    if not exo_api_key or not exo_api_token or not exo_sid or not exo_caller_id or not exo_flow_url:
         return {
-            "error": (
-                "Bulk Exotel env missing. Required: EXO_API_KEY, EXO_API_TOKEN, "
-                "EXO_CALLER_ID, and EXOTEL_FLOW_URL or EXO_FLOW_ID."
-            )
+            "error": "Missing EXO_API_KEY / EXO_API_TOKEN / EXO_SID / EXO_CALLER_ID / EXOTEL_FLOW_URL or EXO_FLOW_ID"
         }
 
+    delay_sec = int(float(os.getenv("BULK_CALL_DELAY_SEC", "240")))
+
+    # 🔥 IMPORTANT FIX: use India endpoint
     exotel_url = (
         f"https://{exo_api_key}:{exo_api_token}"
-        f"@api.exotel.com/v1/Accounts/{EXO_SID}/Calls/connect.json"
+        f"@api.in.exotel.com/v1/Accounts/{exo_sid}/Calls/connect.json"
     )
-    delay_sec = int(float(os.getenv("BULK_CALL_DELAY_SEC", "240")))
+
     payload = {
         "From": to_number,
         "CallerId": exo_caller_id,
         "Url": exo_flow_url,
-        "TimeLimit": str(delay_sec),
+        "TimeLimit": str(delay_sec),   # 👈 critical for auto hangup
     }
 
     logger.info("Bulk Exotel outbound call URL: %s", exotel_url)
@@ -2788,6 +2785,7 @@ def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
 
     try:
         import requests
+
         resp = requests.post(
             exotel_url,
             data=payload,
@@ -2795,14 +2793,16 @@ def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
             timeout=20,
         )
         resp.raise_for_status()
+
         content_type = resp.headers.get("content-type", "")
         if "application/json" in content_type.lower():
             return resp.json()
+
         return {"raw": resp.text}
+
     except Exception as e:
         logger.exception("Error placing bulk Exotel outbound call: %s", e)
         return {"error": str(e)}
-
 
 @app.post("/bulk-call-excel-sequential")
 async def bulk_call_excel_sequential(request: Request):
