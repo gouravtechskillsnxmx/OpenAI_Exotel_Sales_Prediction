@@ -137,7 +137,7 @@ EXO_API_KEY = os.getenv("EXO_API_KEY", "")
 EXO_API_TOKEN = os.getenv("EXO_API_TOKEN", "")
 EXO_FLOW_ID = os.getenv("EXO_FLOW_ID", "")
 EXO_CALLER_ID = os.getenv("EXO_CALLER_ID", "")
-
+MAX_OPENAI_SESSION_SEC = int(os.getenv("BULK_CALL_DELAY_SEC", "240"))
 # Exotel outbound flow URL. If not explicitly set, build from EXO_SID + EXO_FLOW_ID when possible.
 EXOTEL_FLOW_URL = os.getenv("EXOTEL_FLOW_URL", "").strip()
 if not EXOTEL_FLOW_URL:
@@ -1634,6 +1634,16 @@ async def exotel_media(ws: WebSocket):
             openai_session = ClientSession()
             logger.info("Connecting to OpenAI Realtime WS...")
             openai_ws = await openai_session.ws_connect(url, headers=headers)
+            async def auto_close_openai():
+                try:
+                    await asyncio.sleep(MAX_OPENAI_SESSION_SEC)
+                    if openai_ws and not openai_ws.closed:
+                        logger.warning("Force closing OpenAI session after %s sec", MAX_OPENAI_SESSION_SEC)
+                        await openai_ws.close()
+                except Exception:
+                    logger.exception("Error in auto_close_openai")
+
+            asyncio.create_task(auto_close_openai())
             logger.info("OpenAI Realtime WS connected.")
             save_ppm_debug_event(
                 call_id=conn_call_id or "",
