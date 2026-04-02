@@ -2770,7 +2770,7 @@ def exotel_outbound_call_bulk_direct(to_number: str) -> Dict[str, Any]:
     # 🔥 IMPORTANT FIX: use India endpoint
     exotel_url = (
         f"https://{exo_api_key}:{exo_api_token}"
-        f"@api.in.exotel.com/v1/Accounts/{exo_sid}/Calls/connect.json"
+        f"@api.exotel.com/v1/Accounts/{exo_sid}/Calls/connect.json"
     )
 
     payload = {
