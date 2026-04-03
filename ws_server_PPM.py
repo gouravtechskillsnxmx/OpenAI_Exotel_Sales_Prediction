@@ -765,6 +765,18 @@ HTML_PAGE = """
       <div id="bulk-progress-box" style="margin-top:12px; display:none; border:1px solid #ddd; padding:12px; border-radius:8px;">
         <div><strong>Batch ID:</strong> <span id="bulk-progress-batch-id"></span></div>
         <div><strong>Status:</strong> <span id="bulk-progress-status">idle</span></div>
+                <div style="margin:10px 0 8px 0;">
+          <div style="font-size:12px; margin-bottom:4px;">
+            <strong>Progress:</strong>
+            <span id="bulk-progress-percent">0%</span>
+            <span id="bulk-progress-fraction" style="margin-left:8px;"></span>
+          </div>
+          <div style="width:100%; height:16px; background:#e9ecef; border-radius:999px; overflow:hidden;">
+            <div id="bulk-progress-bar-fill"
+                 style="height:100%; width:0%; background:#007bff; transition:width 0.4s ease;">
+            </div>
+          </div>
+        </div>
         <div><strong>Total:</strong> <span id="bulk-progress-total">0</span></div>
         <div><strong>Running:</strong> <span id="bulk-progress-running">0</span></div>
         <div><strong>Completed:</strong> <span id="bulk-progress-completed">0</span></div>
@@ -839,19 +851,49 @@ HTML_PAGE = """
 
       let bulkProgressTimer = null;
 
-      function renderBulkProgress(data) {
+     function renderBulkProgress(data) {
         const box = document.getElementById("bulk-progress-box");
         box.style.display = "block";
+
+        const total = Number(data.total_numbers || 0);
+        const completed = Number(data.completed_count || 0);
+        const failed = Number(data.failed_count || 0);
+        const done = completed + failed;
+        const percent = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
         document.getElementById("bulk-progress-batch-id").textContent = data.batch_id || "";
         document.getElementById("bulk-progress-status").textContent = data.status || "";
-        document.getElementById("bulk-progress-total").textContent = data.total_numbers || 0;
+        document.getElementById("bulk-progress-total").textContent = total;
         document.getElementById("bulk-progress-running").textContent = data.running_count || 0;
-        document.getElementById("bulk-progress-completed").textContent = data.completed_count || 0;
-        document.getElementById("bulk-progress-failed").textContent = data.failed_count || 0;
+        document.getElementById("bulk-progress-completed").textContent = completed;
+        document.getElementById("bulk-progress-failed").textContent = failed;
         document.getElementById("bulk-progress-current-number").textContent = data.current_number || "";
         document.getElementById("bulk-progress-message").textContent = data.message || "";
-      }
 
+        const percentEl = document.getElementById("bulk-progress-percent");
+        const fractionEl = document.getElementById("bulk-progress-fraction");
+        const fillEl = document.getElementById("bulk-progress-bar-fill");
+
+        if (percentEl) {
+          percentEl.textContent = `${percent}%`;
+        }
+
+        if (fractionEl) {
+          fractionEl.textContent = `${done} / ${total} processed`;
+        }
+
+        if (fillEl) {
+          fillEl.style.width = `${percent}%`;
+
+          if (data.status === "completed") {
+            fillEl.style.background = "#28a745";
+          } else if (data.status === "completed_with_errors" || data.status === "failed") {
+            fillEl.style.background = "#dc3545";
+          } else {
+            fillEl.style.background = "#007bff";
+          }
+        }
+      }
       async function pollBulkProgress(batchId) {
         try {
           const resp = await fetch(`/bulk-call-progress/${batchId}`);
@@ -2856,34 +2898,61 @@ async def bulk_call_excel_sequential(request: Request):
         return JSONResponse({"error": "Excel has no rows."}, status_code=400)
 
     raw_numbers = df.iloc[:, 0].tolist()
-
-    def _clean_bulk_number(x: object) -> str:
+        # =========================
+    # ADDITIVE PATCH: force prefix 0, never suffix 0
+    # =========================
+    def _normalize_bulk_number_prefix_zero(x: object) -> str:
         s = "" if x is None else str(x).strip()
         if not s:
             return ""
-        # skip obvious headers like 'phone'
-        if s.lower() in {"phone", "mobile", "number", "contact", "callee", "callee_number"}:
+
+        # Excel float case like 9664902233.0
+        if s.endswith(".0"):
+            s = s[:-2]
+
+        # scientific notation fallback
+        try:
+            if "e" in s.lower():
+                s = str(int(float(s)))
+        except Exception:
+            pass
+
+        # keep digits only
+        s = _re.sub(r"\D", "", s)
+
+        if not s:
             return ""
-        # remove everything except digits and +
-        s = _re.sub(r"[^\d+]", "", s)
-        digits = _re.sub(r"\D", "", s)
-        if not digits:
-            return ""
-        if len(digits) == 10:
-            return "0" + digits
-        if len(digits) == 12 and digits.startswith("91"):
-            return "0" + digits[2:]
-        if len(digits) == 11 and digits.startswith("0"):
-            return digits
-        return digits
+
+        # Handle India formats safely
+        # 10 digits  -> prefix 0 => 0XXXXXXXXXX
+        # 11 digits starting with 0 -> keep as is
+        # 12 digits starting with 91 -> prefix 0 after removing 91 => 0XXXXXXXXXX
+        # 13 digits starting with 091 -> keep first 0 + last 10 digits
+        if len(s) == 10:
+            return "0" + s
+
+        if len(s) == 11 and s.startswith("0"):
+            return s
+
+        if len(s) == 12 and s.startswith("91"):
+            return "0" + s[-10:]
+
+        if len(s) == 13 and s.startswith("091"):
+            return "0" + s[-10:]
+
+        # Fallback:
+        # if number does not start with 0, prefix it once
+        if not s.startswith("0"):
+            return "0" + s
+
+        return s
 
     numbers = []
-    seen = set()
-    for item in raw_numbers:
-        num = _clean_bulk_number(item)
-        if num and num not in seen:
-            seen.add(num)
-            numbers.append(num)
+    for x in raw_numbers:
+        n = _normalize_bulk_number_prefix_zero(x)
+        if n:
+            numbers.append(n)
+
 
     if not numbers:
         return JSONResponse({"error": "No valid callee numbers found in the first column."}, status_code=400)
@@ -3044,32 +3113,60 @@ async def bulk_call_excel_sequential_start(request: Request):
         return JSONResponse({"error": "Excel has no rows."}, status_code=400)
 
     raw_numbers = df.iloc[:, 0].tolist()
-
-    def _clean_bulk_number_start(x: object) -> str:
+        # =========================
+    # ADDITIVE PATCH: force prefix 0, never suffix 0
+    # =========================
+    def _normalize_bulk_number_prefix_zero(x: object) -> str:
         s = "" if x is None else str(x).strip()
         if not s:
             return ""
-        if s.lower() in {"phone", "mobile", "number", "contact", "callee", "callee_number"}:
+
+        # Excel float case like 9664902233.0
+        if s.endswith(".0"):
+            s = s[:-2]
+
+        # scientific notation fallback
+        try:
+            if "e" in s.lower():
+                s = str(int(float(s)))
+        except Exception:
+            pass
+
+        # keep digits only
+        s = _re.sub(r"\D", "", s)
+
+        if not s:
             return ""
-        s = _re.sub(r"[^\d+]", "", s)
-        digits = _re.sub(r"\D", "", s)
-        if not digits:
-            return ""
-        if len(digits) == 10:
-            return "0" + digits
-        if len(digits) == 12 and digits.startswith("91"):
-            return "0" + digits[2:]
-        if len(digits) == 11 and digits.startswith("0"):
-            return digits
-        return digits
+
+        # Handle India formats safely
+        # 10 digits  -> prefix 0 => 0XXXXXXXXXX
+        # 11 digits starting with 0 -> keep as is
+        # 12 digits starting with 91 -> prefix 0 after removing 91 => 0XXXXXXXXXX
+        # 13 digits starting with 091 -> keep first 0 + last 10 digits
+        if len(s) == 10:
+            return "0" + s
+
+        if len(s) == 11 and s.startswith("0"):
+            return s
+
+        if len(s) == 12 and s.startswith("91"):
+            return "0" + s[-10:]
+
+        if len(s) == 13 and s.startswith("091"):
+            return "0" + s[-10:]
+
+        # Fallback:
+        # if number does not start with 0, prefix it once
+        if not s.startswith("0"):
+            return "0" + s
+
+        return s
 
     numbers = []
-    seen = set()
-    for item in raw_numbers:
-        num = _clean_bulk_number_start(item)
-        if num and num not in seen:
-            seen.add(num)
-            numbers.append(num)
+    for x in raw_numbers:
+        n = _normalize_bulk_number_prefix_zero(x)
+        if n:
+            numbers.append(n)
 
     if not numbers:
         return JSONResponse({"error": "No valid callee numbers found in the first column."}, status_code=400)
