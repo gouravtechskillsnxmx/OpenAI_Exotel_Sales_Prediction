@@ -2048,7 +2048,8 @@ async def exotel_media(ws: WebSocket):
                 })
             except Exception:
                 logger.exception("Remote PPM log-debug-event failed (openai_session_update_opening_rules_added)")
-
+            
+            await asyncio.sleep(0.25)
             # Ask the model to start the first greeting turn
             await send_openai(
                 {
@@ -2069,47 +2070,63 @@ async def exotel_media(ws: WebSocket):
                       },
                 }
             )
+                        # =========================
+            # ADDITIVE AUTO-SPEAK + RE-ENGAGE (FIXED)
             # =========================
-                # ADDITIVE AUTO-SPEAK + RE-ENGAGE (DO NOT MODIFY EXISTING FLOW)
-            # =========================
-
             if VOICE_ENABLE_START_NUDGE:
 
                 async def _auto_speak_nudge():
-                    await asyncio.sleep(VOICE_AUTO_SPEAK_DELAY_MS / 1000.0)
+                    try:
+                        await asyncio.sleep(max(0, VOICE_AUTO_SPEAK_DELAY_MS) / 1000.0)
 
-                    if not caller_spoke_flag:
-                        try:
-                            await send_openai({
-                                "type": "response.create",
-                                "response": {
-                                    "instructions": "Continue speaking the opening line naturally if user is silent.",
-                                    "modalities": ["text", "audio"],
-                                },
-                            })
-                        except Exception:
-                            logger.exception("Auto speak nudge failed")
+                        if caller_spoke_flag:
+                            return
 
-                    async def _reengage_nudge():
-                        await asyncio.sleep(VOICE_REENGAGE_DELAY_MS / 1000.0)
+                        await send_openai({
+                            "type": "response.create",
+                            "response": {
+                                "instructions": (
+                                    "User is still silent. Repeat the same opening line once, naturally. "
+                                    "Do not add any new intro. Then stop and listen."
+                                ),
+                                "modalities": ["text", "audio"],
+                            },
+                        })
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("Auto speak nudge failed")
 
-                        if not caller_spoke_flag:
-                            try:
-                                await send_openai({
-                                    "type": "response.create",
-                                    "response": {
-                                        "instructions": (
-                                            "User seems silent. Say: "
-                                            "'Aap sun pa rahe hain? Ek quick point bolke nikal jaunga.'"
-                                        ),
-                                        "modalities": ["text", "audio"],
-                                    },
-                                })
-                            except Exception:
-                                logger.exception("Re-engage nudge failed")
+                async def _reengage_nudge():
+                    try:
+                        await asyncio.sleep(max(0, VOICE_REENGAGE_DELAY_MS) / 1000.0)
 
-                            auto_speak_task = asyncio.create_task(_auto_speak_nudge())
-                            reengage_task = asyncio.create_task(_reengage_nudge())
+                        if caller_spoke_flag:
+                            return
+
+                        await send_openai({
+                            "type": "response.create",
+                            "response": {
+                                "instructions": (
+                                    "User seems silent. Say exactly: "
+                                    "'Aap sun pa rahe hain? Ek quick point bolke nikal jaunga.' "
+                                    "Then stop and listen."
+                                ),
+                                "modalities": ["text", "audio"],
+                            },
+                        })
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("Re-engage nudge failed")
+
+                if auto_speak_task:
+                    auto_speak_task.cancel()
+                if reengage_task:
+                    reengage_task.cancel()
+
+                auto_speak_task = asyncio.create_task(_auto_speak_nudge())
+                reengage_task = asyncio.create_task(_reengage_nudge())
 
             async def pump():
                 """
@@ -2506,7 +2523,18 @@ async def exotel_media(ws: WebSocket):
                     
                     had_audio = True
 
-                    caller_spoke_flag = True
+                    # Do NOT treat every media frame as real human speech.
+                    # Exotel can send early noise / line audio / ring-side frames.
+                    if len(pcm8) >= 640:   # at least ~40 ms of PCM16 audio
+                        caller_spoke_flag = True
+
+                        if auto_speak_task:
+                            auto_speak_task.cancel()
+                            auto_speak_task = None
+
+                        if reengage_task:
+                            reengage_task.cancel()
+                            reengage_task = None
 
                     # cancel nudges once user speaks
                     if auto_speak_task:
